@@ -1,0 +1,16 @@
+services:
+  sonarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Toronto
+    volumes:
+      - ./config:/config
+      - /mnt/nas-data-4/movies:/movies
+      - /mnt/nas-data-4/downloads:/downloads
+    ports:
+      - 7878:7878
+    restart: unless-stopped
+
