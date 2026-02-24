@@ -1,0 +1,56 @@
+# Tracearr - All-in-One Deployment (Bare Metal Only)
+#
+# Single container with TimescaleDB, Redis, and Tracearr bundled together.
+# **Designed for Unraid and intended for bare metal hosts only.**
+# **NOT recommended for VMs or nested containers.**
+#
+# Secrets are auto-generated on first run — no configuration required.
+#
+# REQUIREMENTS:
+#   - Minimum 3GB RAM (container runs PostgreSQL + Redis + Node.js)
+#   - Containers with less memory will crash with exit code 137 (OOM killed)
+#
+# DEPLOY:
+#   docker compose -f docker/docker-compose.supervised.yml up -d
+#
+# Data is stored in Docker volumes by default.
+# For bind mounts, uncomment the volumes section below.
+
+services:
+  tracearr:
+    image: ghcr.io/connorgallopo/tracearr:supervised
+    shm_size: 512mb  # Required for PostgreSQL shared memory (increase for large imports)
+    mem_limit: 3g    # Minimum 3GB required (PostgreSQL + Redis + Node.js)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536  # TimescaleDB chunks require many file descriptors
+    ports:
+      - "8074:3000"
+    environment:
+      - TZ=${TZ:-UTC}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # - DATABASE_POOL_MAX=50  # Database connection pool size (default: 50)
+      # Optional: Override auto-generated secrets
+      # - JWT_SECRET=${JWT_SECRET}
+      # - COOKIE_SECRET=${COOKIE_SECRET}
+    volumes:
+      - ./postgres:/data/postgres
+      - ./redis:/data/redis
+      - ./data:/data/tracearr
+      # Bind mounts are not recommended for supervised installs
+      # due to permission issues with PostgreSQL and Redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    networks:
+      - net
+
+networks:
+  net:
+    external: true
+
