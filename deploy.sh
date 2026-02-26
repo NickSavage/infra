@@ -2,7 +2,7 @@
 set -e
 
 # Define the list of node folders
-NODES=("nas-1" "nas-2" "server-1" "server-2")
+NODES=("nas-1" "nas-2" "server-1" "mac-1")
 
 # Get the absolute path of the starting directory
 BASE_DIR=$(pwd)
