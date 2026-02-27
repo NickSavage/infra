@@ -1,0 +1,16 @@
+---
+services:
+  jellyseerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: jellyseerr
+    user: root
+    environment:
+      - LOG_LEVEL=debug
+      - TZ=America/Toronto
+      - PORT=5055 #optional
+    ports:
+      - 5055:5055
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
