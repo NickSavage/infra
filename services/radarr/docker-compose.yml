@@ -10,6 +10,7 @@ services:
       - ./config:/config
       - /mnt/nas-data-4/movies:/movies
       - /mnt/nas-data-4/downloads:/downloads
+      - /mnt/nas-data-4/nzb:/nzb
     ports:
       - 7878:7878
     restart: unless-stopped

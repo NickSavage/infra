@@ -1,0 +1,10 @@
+services:
+  filebrowser:
+    image: gtstef/filebrowser:stable
+    container_name: filebrowser
+    volumes:
+      - /mnt/nas-data-4/files:/srv
+      - ./data:/home/filebrowser/data
+    ports:
+      - "8084:80"
+    restart: unless-stopped

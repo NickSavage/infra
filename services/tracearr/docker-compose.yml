@@ -27,6 +27,8 @@ services:
         hard: 65536  # TimescaleDB chunks require many file descriptors
     ports:
       - "8074:3000"
+    env_file:
+      - .env
     environment:
       - TZ=${TZ:-UTC}
       - LOG_LEVEL=${LOG_LEVEL:-info}

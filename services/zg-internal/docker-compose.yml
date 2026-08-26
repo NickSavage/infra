@@ -1,0 +1,27 @@
+services:
+  frontend:
+    image: nsavage/zettelgarden_frontend:latest
+    container_name: zg-frontend-internal
+    restart: always
+    ports:
+      - "3003:3000"
+    networks:
+      - net
+
+  go_backend:
+    image: nsavage/zettelgarden_go_backend:latest
+    container_name: zettel-backend
+    restart: always
+    ports:
+      - "8085:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - /home/nick/zg:/usr/src/app/data
+    networks:
+      - net
+
+networks:
+  net:
+    external: true

@@ -1,0 +1,40 @@
+services:
+  mindwtr-cloud:
+    image: ghcr.io/dongdongbh/mindwtr-cloud:latest
+    build:
+      context: ..
+      dockerfile: docker/cloud/Dockerfile
+    container_name: mindwtr-cloud
+    hostname: mindwtr-cloud
+    restart: always
+    cpus: "1.0"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/health >/dev/null || exit 1"]
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - 8787:8787
+    environment:
+      - MINDWTR_CLOUD_AUTH_TOKENS=${MINDWTR_CLOUD_AUTH_TOKENS:?MINDWTR_CLOUD_AUTH_TOKENS must be set}
+      - MINDWTR_CLOUD_CORS_ORIGIN=${MINDWTR_CLOUD_CORS_ORIGIN:?MINDWTR_CLOUD_CORS_ORIGIN must be set}
+    volumes:
+      - ./data:/app/cloud_data
+
+#   mindwtr-app:
+#     image: ghcr.io/dongdongbh/mindwtr-app:latest
+#     build:
+#       context: ..
+#       dockerfile: docker/app/Dockerfile
+#     container_name: mindwtr-app
+#     hostname: mindwtr-app
+#     restart: always
+#     cpus: "1.0"
+#     mem_limit: 512m
+#     depends_on:
+#       mindwtr-cloud:
+#         condition: service_healthy
+#     ports:
+#       - 5173:5173

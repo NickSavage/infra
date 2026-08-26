@@ -1,0 +1,11 @@
+services:
+  freshrss:
+    image: freshrss/freshrss:latest
+    container_name: freshrss
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8282:80"
+    volumes:
+      - "./data:/var/www/FreshRSS/data"
+      - "./extensions:/var/www/FreshRSS/extensions"

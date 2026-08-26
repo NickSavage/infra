@@ -1,0 +1,51 @@
+services:
+  mindwtr-cloud:
+    image: ghcr.io/dongdongbh/mindwtr-cloud:latest
+    build:
+      context: ..
+      dockerfile: docker/cloud/Dockerfile
+    container_name: mindwtr-cloud
+    hostname: mindwtr-cloud
+    restart: always
+    cpus: "1.0"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/health >/dev/null || exit 1"]
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    expose:
+      - "8787"
+    environment:
+      - MINDWTR_CLOUD_AUTH_TOKENS=${MINDWTR_CLOUD_AUTH_TOKENS:?MINDWTR_CLOUD_AUTH_TOKENS must be set}
+      - MINDWTR_CLOUD_CORS_ORIGIN=${MINDWTR_CLOUD_CORS_ORIGIN:?MINDWTR_CLOUD_CORS_ORIGIN must be set}
+      - MINDWTR_CLOUD_MAX_BODY_BYTES=${MINDWTR_CLOUD_MAX_BODY_BYTES:-2000000}
+      - MINDWTR_CLOUD_MAX_ATTACHMENT_BYTES=${MINDWTR_CLOUD_MAX_ATTACHMENT_BYTES:-50000000}
+    volumes:
+      - ./data:/app/cloud_data
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: mindwtr-caddy
+    hostname: mindwtr-caddy
+    restart: always
+    cpus: "0.5"
+    mem_limit: 256m
+    depends_on:
+      mindwtr-cloud:
+        condition: service_healthy
+    ports:
+      - "${MINDWTR_HTTP_PORT:-80}:80"
+      - "${MINDWTR_HTTPS_PORT:-443}:443"
+      - "${MINDWTR_HTTPS_PORT:-443}:443/udp"
+    environment:
+      - MINDWTR_CLOUD_DOMAIN=${MINDWTR_CLOUD_DOMAIN:?MINDWTR_CLOUD_DOMAIN must be set}
+    volumes:
+      - ./${MINDWTR_CADDYFILE:-Caddyfile.https}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

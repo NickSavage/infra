@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  typesense:
+    image: typesense/typesense:28.0
+    container_name: typesense
+    restart: unless-stopped
+    ports:
+      - "8109:8108"
+    environment:
+      TYPESENSE_API_KEY: 'chamber'
+      TYPESENSE_DATA_DIR: '/data'
+    volumes:
+      - ./data:/data
+    networks:
+      - net
+
+networks:
+  net:
+    external: true
