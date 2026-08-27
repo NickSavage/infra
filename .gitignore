@@ -38,6 +38,7 @@ storage/
 exports/
 models/
 user-files/
+uploads/
 logs/
 processlogs/
 tasklogs/
