@@ -1,0 +1,31 @@
+services:
+  nominatim:
+    image: mediagis/nominatim:5.3
+    container_name: nominatim
+    restart: unless-stopped
+    shm_size: '2g'
+    ports:
+      - "8080:8080"
+    environment:
+      - PBF_URL=https://download.geofabrik.de/north-america/canada-latest.osm.pbf
+      - REPLICATION_URL=https://download.geofabrik.de/north-america/canada-updates/
+      - UPDATE_MODE=continuous
+      - REPLICATION_UPDATE_INTERVAL=86400
+      - NOMINATIM_PASSWORD=s3cure_nominatim_pw
+      - GUNICORN_WORKERS=4
+      # Tune Postgres down to .20's ~31Gi RAM
+      - POSTGRES_SHARED_BUFFERS=4GB
+      - POSTGRES_MAINTENANCE_WORK_MEM=4GB
+      - POSTGRES_AUTOVACUUM_WORK_MEM=1GB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=12GB
+      - POSTGRES_WORK_MEM=50MB
+      - POSTGRES_SYNCHRONOUS_COMMIT=off
+    volumes:
+      # Named volumes -> live on .20's local NVMe (/var/lib/docker/volumes),
+      # NOT the shared NFS mount. Import is write-heavy; NFS was ~days slow.
+      # NOTE: no flatnode mount on purpose -- Canada import doesn't need it and
+      # the file is ~113G (indexed by max OSM node ID ~9.4B, not extract size).
+      - nominatim-postgres:/var/lib/postgresql/16/main
+
+volumes:
+  nominatim-postgres:
