@@ -1,0 +1,17 @@
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-wife
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    network_mode: host
+    volumes:
+      - ./data:/opt/data
+    environment:
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
