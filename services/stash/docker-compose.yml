@@ -1,0 +1,27 @@
+services:
+  stash:
+    image: stashapp/stash:latest
+    container_name: stash
+    restart: unless-stopped
+    ports:
+      - "9999:9999"
+    environment:
+      - STASH_STASH=/root/.stash
+      - STASH_METADATA=/metadata
+      - STASH_GENERATED=/generated
+      - STASH_CACHE=/cache
+    volumes:
+      - stash-config:/root/.stash
+      - stash-metadata:/metadata
+      - stash-generated:/generated
+      - stash-cache:/cache
+      # Media is mounted read-only — Stash never writes into the library
+      - /mnt/nas-data-4/data/media/porn:/data:ro
+    # Stash generates video previews + transcodes; give it decent CPU
+    cpus: 4
+
+volumes:
+  stash-config:
+  stash-metadata:
+  stash-generated:
+  stash-cache:
