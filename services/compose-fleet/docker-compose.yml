@@ -1,0 +1,10 @@
+services:
+  compose-fleet:
+    container_name: compose-fleet
+    image: nsavage/compose-fleet:latest   # built locally on .20
+    ports: ["8940:8940"]
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file: .env                        # FLEET_PASSWORD (gitignored)
+    volumes:
+      - /home/nick/compose-fleet:/data    # .20 LOCAL disk — DB/keys NEVER on NFS
