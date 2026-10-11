@@ -44,3 +44,4 @@ processlogs/
 tasklogs/
 oplog.sqlite*
 data/
+backups/
