@@ -1,13 +1,16 @@
 services:
   app:
-    image: 'jc21/nginx-proxy-manager:2.15.1'
+    image: jc21/nginx-proxy-manager:2.15.1
     restart: unless-stopped
     environment:
       TZ: "America/New_York"
     ports:
-      - '80:80'
-      - '81:81'
-      - '443:443'
+      - 80:80
+      - 81:81
+      - 443:443
     volumes:
-      - ./data:/data
-      - ./letsencrypt:/etc/letsencrypt
+      - data:/data
+      - letsencrypt:/etc/letsencrypt
+volumes:
+  data:
+  letsencrypt:

@@ -6,10 +6,12 @@ services:
     ports:
       - 1411:1411
     volumes:
-      - "./data:/app/data"
+      - data:/app/data
     healthcheck:
       test: ["CMD", "/app/pocket-id", "healthcheck"]
       interval: 1m30s
       timeout: 5s
       retries: 2
       start_period: 10s
+volumes:
+  data:
