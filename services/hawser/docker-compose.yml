@@ -11,6 +11,13 @@ services:
     environment:
       - PORT=2376
       - TOKEN=${HAWSER_TOKEN}
+    # Upstream's healthcheck runs the image's shell/wget. Every non-Go binary in this image is
+    # built for x86-64-v2, so on .160 (AMD Phenom II X6 1055T, no AVX) the check SIGILLs
+    # (exit 132) and that host would sit permanently "unhealthy" even though the agent is fine.
+    # Disabled uniformly; the real health signal is Dockhand's environment test
+    # (POST /api/environments/<id>/test) plus the agent's own auto-reconnect.
+    healthcheck:
+      disable: true
     labels:
       - dockhand.update=false
 
