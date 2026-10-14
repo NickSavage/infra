@@ -1,0 +1,20 @@
+services:
+  dockhand:
+    image: fnsys/dockhand:latest
+    container_name: dockhand
+    restart: unless-stopped
+    ports:
+      - "3005:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dockhand_data:/app/data
+    environment:
+      - PUID=1001
+      - PGID=1001
+    group_add:
+      - "996"
+    labels:
+      - dockhand.update=false
+
+volumes:
+  dockhand_data:
