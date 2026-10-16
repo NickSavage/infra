@@ -8,6 +8,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dockhand_data:/app/data
+      # Matching-path mount of the shared config tree so Dockhand can adopt the
+      # existing compose files in place (adopt requires the path to exist on
+      # Dockhand's own filesystem) and edit/save them from the UI.
+      - /mnt/nas-2-fast-data/config:/mnt/nas-2-fast-data/config
     environment:
       - PUID=1001
       - PGID=1001
