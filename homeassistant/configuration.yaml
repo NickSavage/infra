@@ -1,0 +1,88 @@
+
+homeassistant:
+   external_url: "https://home.nicksavage.ca"
+   internal_url: "https://192.168.0.93:8123"
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+http:
+    use_x_forwarded_for: true
+    ssl_certificate: "/config/ssl/ssl-cert-snakeoil.pem"
+    ssl_key: "/config/ssl/ssl-cert-snakeoil.key"
+    trusted_proxies:
+    - 0.0.0.0/0
+
+notify:
+    - platform: tts
+      name: in_the_living_room
+      entity_id: tts.piper
+      media_player: media_player.living_room_2
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+alarm_control_panel:
+  - platform: manual
+
+group:
+  presence_home:
+    name: Presence Home
+    entities:
+      - person.nick_savage
+      - person.nina_bertrand
+
+mqtt:
+  sensor:
+    - name: "Syncthing Status"
+      state_topic: "servers/selena/syncthing/status"
+    - name: "Jellyfin Status"
+      state_topic: "servers/selena/jellyfin/status"    
+    - name: "Harmonia Status"
+      state_topic: "servers/selena/harmonia/status"    
+    - name: "home-gateway Status"
+      state_topic: "servers/selena/home-gateway/status"    
+    - name: "zettelgarden Status"
+      state_topic: "servers/selena/zettelgarden/status"    
+    - name: "codescribble Status"
+      state_topic: "servers/selena/codescribble/status"    
+    - name: "selene cpu percentage" 
+      state_topic: "servers/selene/stats/cpu_percentage"
+    - name: "selene mem total" 
+      state_topic: "servers/selene/stats/mem_total"
+    - name: "selene cpu percent system"
+      state_topic: "system/selene/stats/cpu_percent"
+      unit_of_measurement: "%"
+    - name: "selene mem total system"
+      state_topic: "system/selene/stats/mem_total"
+      unit_of_measurement: "GB"
+    - name: "selene mem used system"
+      state_topic: "system/selene/stats/mem_used"
+      unit_of_measurement: "GB"
+    - name: "selene mem free system"
+      state_topic: "system/selene/stats/mem_free"
+      unit_of_measurement: "GB"
+    - name: "selene mem percent system"
+      state_topic: "system/selene/stats/mem_percent"
+      unit_of_measurement: "%"
+    - name: "selene uptime seconds"
+      state_topic: "system/selene/stats/uptime_seconds"
+      unit_of_measurement: "s" # seconds
+      device_class: "duration" # Help Home Assistant interpret the value
+    - name: "selene disk total system"
+      state_topic: "system/selene/stats/disk_total"
+      unit_of_measurement: "GB"
+    - name: "selene disk used system"
+      state_topic: "system/selene/stats/disk_used"
+      unit_of_measurement: "GB"
+    - name: "selene disk free system"
+      state_topic: "system/selene/stats/disk_free"
+      unit_of_measurement: "GB"
+    - name: "selene disk percent system"
+      state_topic: "system/selene/stats/disk_percent"
+      unit_of_measurement: "%"

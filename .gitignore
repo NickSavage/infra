@@ -60,3 +60,22 @@ services/dawarich/dawarich_shared/
 services/dawarich/dawarich_backups/
 *.sql
 *.bak-*
+
+# ---------- Home Assistant: compose + authored config tracked, state ignored ----------
+homeassistant/.storage/
+homeassistant/.cache/
+homeassistant/.cloud/
+homeassistant/.ha_run.lock
+homeassistant/.HA_VERSION
+homeassistant/core
+homeassistant/deps/
+homeassistant/backups/
+homeassistant/image/
+homeassistant/tts/
+homeassistant/ssl/
+homeassistant/home-assistant_v2.db*
+homeassistant/custom_components/hacs/
+
+# ---------- open-webui: compose only ----------
+open-webui/*
+!open-webui/docker-compose.yml

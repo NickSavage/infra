@@ -1,0 +1,12 @@
+version: '3'
+services:
+  homeassistant:
+    container_name: home-assistant
+    image: homeassistant/home-assistant:stable
+    volumes:
+      - ./:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=America/Toronto
+    restart: unless-stopped
+    network_mode: host
