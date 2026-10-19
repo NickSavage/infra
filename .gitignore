@@ -58,6 +58,5 @@ services/nginx-proxy-manager/letsencrypt/
 services/dawarich/dawarich_public/
 services/dawarich/dawarich_shared/
 services/dawarich/dawarich_backups/
-services/fava/beancount/
 *.sql
 *.bak-*
