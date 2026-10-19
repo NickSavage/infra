@@ -1,0 +1,16 @@
+services:
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    environment:
+      - PUID=1000        # your user ID — run `id` to check
+      - PGID=1000        # your group ID
+      - TZ=America/Toronto
+    volumes:
+      - ./config:/config
+      - /mnt/nas-data-4/nzb/downloads:/downloads     # completed downloads
+      - /mnt/nas-data-4/nzb/incomplete:/incomplete   # temp while downloading
+    ports:
+      - "8082:8080"
+      - "9090:9090"                        # HTTPS if you enable it
+    restart: unless-stopped

@@ -1,0 +1,30 @@
+version: "3.8"
+services:
+  backrest:
+    image: garethgeorge/backrest:latest
+    container_name: backrest
+    hostname: backrest
+    volumes:
+      - ./data:/data
+      - ./config:/config
+      - ./cache:/cache
+      - ./tmp:/tmp
+      - /mnt/nas-data-1:/mnt/nas-data-1
+      - /mnt/nas-2-fast-data:/mnt/nas-2-fast-data
+      - /mnt/nas-2-fast-data-2:/mnt/nas-2-fast-data-2
+      - /mnt/nas-data-4:/mnt/nas-data-4
+    environment:
+      - BACKREST_DATA=/data
+      - BACKREST_CONFIG=/config/config.json
+      - XDG_CACHE_HOME=/cache
+      - TMPDIR=/tmp
+      - TZ=America/Toronto
+    ports:
+      - "9898:9898"
+    restart: unless-stopped
+    networks:
+      - net
+
+networks:
+  net:
+    external: true

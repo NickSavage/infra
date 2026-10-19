@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  qbittorrent:
+    image: linuxserver/qbittorrent:latest
+    container_name: qbittorrent-nas
+    restart: unless-stopped
+    ports:
+      - "6882:6882/tcp"
+      - "6882:6882/udp"
+      - "8091:8091"
+    volumes:
+      - ./:/config
+      - /mnt/nas-data-4/downloads:/downloads
+    environment:
+      - WEBUI_PORT=8091
+      - PUID=1000
+      - PGID=100
+      - HOME=/config
+      - TZ=Etc/UTC
+      - TORRENTING_PORT=6882

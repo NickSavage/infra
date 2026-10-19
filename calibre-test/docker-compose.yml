@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  calibre-web:
+    image: linuxserver/calibre-web:latest
+    container_name: calibre-web-test
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    volumes:
+      - /mnt/nas-data-4/data/media/books/calibre:/calibre-library
+      - ./:/config
+    environment:
+      - TZ=Etc/UTC  # Set your timezone if needed

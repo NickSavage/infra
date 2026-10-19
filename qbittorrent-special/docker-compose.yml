@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  qbittorrent:
+    image: linuxserver/qbittorrent:latest
+    container_name: qbittorrent-special
+    restart: unless-stopped
+    ports:
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+      - "8090:8090"
+    volumes:
+      - ./:/config
+      - /mnt/nas-data-4/data/media/porn/downloads:/downloads
+    environment:
+      - WEBUI_PORT=8090
+      - PUID=1000
+      - PGID=100
+      - HOME=/config
+      - TZ=Etc/UTC
+      - TORRENTING_PORT=6881
