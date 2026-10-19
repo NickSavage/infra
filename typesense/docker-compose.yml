@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  typesense:
+    image: typesense/typesense:28.0
+    container_name: typesense
+    restart: unless-stopped
+    ports:
+      - "8108:8108"
+    environment:
+      # value lives in the gitignored .env next to this file
+      TYPESENSE_API_KEY: "${TYPESENSE_API_KEY:?set TYPESENSE_API_KEY in .env}"
+      TYPESENSE_DATA_DIR: '/data'
+    volumes:
+      - ./data:/data
+    networks:
+      - net
+
+networks:
+  net:
+    external: true
