@@ -4,6 +4,8 @@ services:
     image: nsavage/fava:latest
     container_name: fava
     restart: unless-stopped
+    command: ["fava", "--host", "0.0.0.0", "--port", "5000",
+              "/beancount/corp.bean", "/beancount/personal.bean"]
     expose:
       - "5000"
     ports:
