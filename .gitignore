@@ -45,3 +45,19 @@ tasklogs/
 oplog.sqlite*
 data/
 backups/
+
+# ---------- app-state trees of stacks whose compose file is tracked ----------
+# These are runtime/state dirs (config dirs, PG data, TLS keys, ledgers).
+# Ignoring them does NOT untrack anything already committed.
+config/
+postgres/
+dind-data/
+letsencrypt/
+services/forgejo/forgejo/
+services/nginx-proxy-manager/letsencrypt/
+services/dawarich/dawarich_public/
+services/dawarich/dawarich_shared/
+services/dawarich/dawarich_backups/
+services/fava/beancount/
+*.sql
+*.bak-*
