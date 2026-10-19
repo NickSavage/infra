@@ -79,3 +79,9 @@ homeassistant/custom_components/hacs/
 # ---------- open-webui: compose only ----------
 open-webui/*
 !open-webui/docker-compose.yml
+
+# ---------- bytecode / editor scratch ----------
+__pycache__/
+*.pyc
+*.swp
+*.swo
