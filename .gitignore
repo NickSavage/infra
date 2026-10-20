@@ -85,3 +85,6 @@ __pycache__/
 *.pyc
 *.swp
 *.swo
+# openmw-web runtime dirs (served client bundle + Morrowind game files)
+play/
+gamedata/
