@@ -78,8 +78,11 @@ if [ "$LOCAL" -eq 1 ]; then
   $SUDO docker ps --filter name=telegraf --format '   {{.Names}}  {{.Status}}'
 else
   [ "$SSH" -eq 1 ] || { echo "node $NODE has no ssh path — re-run with --local on that host" >&2; exit 1; }
-  tar czf - -C "$STAGE" . | ssh "agent@$HOST" 'rm -rf /tmp/tg-deploy && mkdir -p /tmp/tg-deploy && tar xzf - -C /tmp/tg-deploy'
-  ssh "agent@$HOST" "
+  # -o StrictHostKeyChecking=accept-new: auto-add a first-seen host key but still refuse
+  # a CHANGED one. The automation account's known_hosts may legitimately be empty.
+  SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+  tar czf - -C "$STAGE" . | ssh $SSH_OPTS "agent@$HOST" 'rm -rf /tmp/tg-deploy && mkdir -p /tmp/tg-deploy && tar xzf - -C /tmp/tg-deploy'
+  ssh $SSH_OPTS "agent@$HOST" "
     set -e
     sudo mkdir -p $DEST
     sudo install -o root -g root -m 644 /tmp/tg-deploy/Dockerfile         $DEST/Dockerfile
