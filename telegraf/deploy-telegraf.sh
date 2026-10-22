@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy-telegraf.sh <node> [--local] [--build]
+# deploy-telegraf.sh <node> [--local]
 #
 # Copies one node's Telegraf stack from this repo directory to that host's LOCAL
 # disk (/config/telegraf) and (re)starts it.
@@ -7,25 +7,28 @@
 #   node ∈ eos | nas-1 | nas-2 | server-1 | server-3
 #
 # Default runs over ssh as agent@<host> (NOPASSWD sudo on the four servers).
-#   --local   run ON the target host itself (required for eos: no agent@eos, and
-#             nick has no NOPASSWD sudo there — run it by hand on the desktop)
-#   --build   rebuild the image (only needed after a Dockerfile change)
+#   --local   run ON the target host itself (required for eos: nothing ssh's into it,
+#             and nick has no NOPASSWD sudo on the desktop — run it by hand there)
 #
-# Runtime lives on local disk on purpose: these agents report host/NFS health, so
-# they must not need the shared /mnt/nas-2-fast-data mount to be up in order to start.
+# The agent runs the STOCK image pinned in docker-compose.yml (telegraf:1.35.2). There
+# is no local build any more: the custom image existed only to add the Ookla speedtest
+# CLI, which no config has called since 2026-10-22. To move the version, edit the pin in
+# docker-compose.yml and deploy EVERY node so the fleet stays identical.
+#
+# Runtime lives on local disk on purpose: these agents report host/NFS health, so they
+# must not need the shared /mnt/nas-2-fast-data mount to be up in order to start.
 # See README.md in this directory for the full picture.
 set -euo pipefail
 
-NODE=""; LOCAL=0; BUILD=0
+NODE=""; LOCAL=0
 for a in "$@"; do
   case "$a" in
     --local) LOCAL=1 ;;
-    --build) BUILD=1 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) NODE="$a" ;;
   esac
 done
-[ -n "$NODE" ] || { echo "usage: deploy-telegraf.sh <node> [--local] [--build]" >&2; exit 2; }
+[ -n "$NODE" ] || { echo "usage: deploy-telegraf.sh <node> [--local]" >&2; exit 2; }
 
 SRC=$(cd "$(dirname "$0")" && pwd)
 DEST=/config/telegraf
@@ -50,7 +53,6 @@ fi
 [ -n "$TOKEN" ] || { echo "INFLUXDB_TOKEN is empty (checked environment and $SRC/.env)" >&2; exit 1; }
 
 STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
-install -m 644 "$SRC/Dockerfile"          "$STAGE/Dockerfile"
 install -m 644 "$SRC/docker-compose.yml"  "$STAGE/docker-compose.yml"
 install -m 644 "$SRC/conf/$NODE.conf"     "$STAGE/telegraf.conf"
 install -m 600 /dev/null                  "$STAGE/.env"
@@ -59,12 +61,12 @@ if [ -f "$SRC/override/$NODE.docker-compose.yml" ]; then
   install -m 644 "$SRC/override/$NODE.docker-compose.yml" "$STAGE/docker-compose.override.yml"
 fi
 
-COMPOSE_ARGS="up -d"; [ "$BUILD" -eq 1 ] && COMPOSE_ARGS="up -d --build"
-
 # `docker compose up -d` does NOT recreate a container when only the CONTENT of a
 # bind-mounted file changed (telegraf.conf) — the compose config hash is unchanged, so
 # telegraf would keep running the OLD config until something restarts it. Both branches
-# capture the deployed conf's hash first and restart afterwards if it changed.
+# capture the deployed conf's hash first and restart afterwards if it changed. A changed
+# image pin or compose file DOES recreate on its own.
+COMPOSE_ARGS="up -d"
 
 echo "== $NODE ($HOST) ← $SRC"
 if [ "$LOCAL" -eq 1 ]; then
@@ -72,11 +74,10 @@ if [ "$LOCAL" -eq 1 ]; then
   [ "$(id -u)" -eq 0 ] || SUDO="sudo"
   $SUDO mkdir -p "$DEST"
   OLDCONF=$($SUDO md5sum "$DEST/telegraf.conf" 2>/dev/null | cut -d' ' -f1)
-  $SUDO install -o root -g root -m 644 "$STAGE/Dockerfile"         "$DEST/Dockerfile"
   $SUDO install -o root -g root -m 644 "$STAGE/docker-compose.yml" "$DEST/docker-compose.yml"
   $SUDO install -o root -g root -m 644 "$STAGE/telegraf.conf"      "$DEST/telegraf.conf"
   $SUDO install -o root -g root -m 600 "$STAGE/.env"               "$DEST/.env"
-  $SUDO rm -f "$DEST/docker-compose.override.yml"
+  $SUDO rm -f "$DEST/Dockerfile" "$DEST/docker-compose.override.yml"
   if [ -f "$STAGE/docker-compose.override.yml" ]; then
     $SUDO install -o root -g root -m 644 "$STAGE/docker-compose.override.yml" "$DEST/docker-compose.override.yml"
   fi
@@ -97,11 +98,10 @@ else
     set -e
     sudo mkdir -p $DEST
     OLDCONF=\$(sudo md5sum $DEST/telegraf.conf 2>/dev/null | cut -d' ' -f1)
-    sudo install -o root -g root -m 644 /tmp/tg-deploy/Dockerfile         $DEST/Dockerfile
     sudo install -o root -g root -m 644 /tmp/tg-deploy/docker-compose.yml $DEST/docker-compose.yml
     sudo install -o root -g root -m 644 /tmp/tg-deploy/telegraf.conf      $DEST/telegraf.conf
     sudo install -o root -g root -m 600 /tmp/tg-deploy/.env               $DEST/.env
-    sudo rm -f $DEST/docker-compose.override.yml
+    sudo rm -f $DEST/Dockerfile $DEST/docker-compose.override.yml
     if [ -f /tmp/tg-deploy/docker-compose.override.yml ]; then
       sudo install -o root -g root -m 644 /tmp/tg-deploy/docker-compose.override.yml $DEST/docker-compose.override.yml
     fi

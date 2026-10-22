@@ -5,7 +5,7 @@
 #
 # Layout
 #   conf/<node>.conf          per-node telegraf config (the only real difference)
-#   docker-compose.yml        base stack, used by every node
+#   docker-compose.yml        base stack, used by every node (pins the stock image)
 #   override/<node>....yml    optional per-node additions (currently nas-2 only)
 #   deploy-telegraf.sh        copies a node's stack to that host and restarts it
 #   .env                      gitignored: the InfluxDB WRITE token (see below)
@@ -23,11 +23,9 @@
 # (eos, server-1, server-3) on 2026-10-22: [[inputs.exec]] runs at the agent
 # interval, so it was firing every ~1-2 min (~45 runs/hour/node, ~3300/day
 # fleet-wide), Ookla was answering "Limit reached", and no dashboard panel or
-# alert rule ever read the `speedtest` measurement.
-# NOTE (leftover): the Dockerfile still installs the CLI even though nothing calls
-# it now. Dropping the install — or the custom build entirely, since nothing else
-# needs it (compose would just use `image: telegraf:1.35.2`) — is a deliberate
-# follow-up: it means rebuilding/pulling on all five nodes.
+# alert rule ever read the `speedtest` measurement. The local image build went with
+# it — the Dockerfile existed only to add that CLI, so the stack now runs the stock
+# pinned image and there is nothing to build.
 #
 # WHY THE RUNTIME COPY IS LOCAL (/config/telegraf on each host)
 # These agents report host and NFS health, so they must not depend on the shared
@@ -39,8 +37,10 @@
 # DEPLOY
 #   bash deploy-telegraf.sh <node>            # remote mode: copies over ssh to agent@<host>
 #   bash deploy-telegraf.sh <node> --local    # run ON the target host itself
-#   Add --build when the Dockerfile changed (today it only adds the Ookla speedtest
-#   CLI, which no config calls any more — see the leftover note above).
+#
+# A conf-only edit needs the agent restarted to take effect (telegraf reads its config at
+# start); deploy-telegraf.sh detects that and restarts. A changed image pin or compose
+# file recreates the container on its own.
 #
 # Run it as the account whose SSH key is authorized on the targets: that is nick@eos,
 # the fleet default. (There is an `agent` account on the servers, but it has no key of
@@ -50,7 +50,7 @@
 # From the four servers the shared checkout is right here:
 #   bash /mnt/nas-2-fast-data/config/telegraf/deploy-telegraf.sh nas-1
 # From eos (which has no /mnt/nas-2-fast-data mount) use a clone of nick/infra — e.g.
-# ~/code/infra — and supply the token (there is no .env in a fresh clone):
+# ~/code/nick-infra — and supply the token (there is no .env in a fresh clone):
 #   INFLUXDB_TOKEN=$(printf '%s' '<write token>') ~/code/nick-infra/telegraf/deploy-telegraf.sh nas-1
 # deploy-telegraf.sh takes INFLUXDB_TOKEN from the environment when set, else from the
 # gitignored .env beside it.
@@ -70,7 +70,7 @@
 #     |> filter(fn:(r)=> r._measurement=="cpu" and r._field=="usage_idle")
 #     |> group(columns:["node"]) |> last() |> keep(columns:["node","_time"])
 # All five nodes should show a timestamp within the last ~15s. After a deploy also
-# confirm the deployed files match this directory (md5sum of Dockerfile,
-# docker-compose.yml and conf/<node>.conf on the host vs here).
+# confirm the deployed files match this directory (md5sum of docker-compose.yml and
+# conf/<node>.conf on the host vs here).
 #
 # Context / history: ZG 722.10.11 (2026-10-22 audit that found these stacks unversioned).

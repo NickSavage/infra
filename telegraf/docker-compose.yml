@@ -3,12 +3,13 @@
 # Source of truth: nick/infra, telegraf/  (this file is copied to each host by
 # deploy-telegraf.sh, together with conf/<node>.conf → telegraf.conf).
 #
-# The custom image (Dockerfile next to this file) bakes in the Ookla speedtest CLI
-# used by the eos/server-1/server-3 configs; a plain image has no /usr/bin/speedtest.
-# Rebuild with: docker compose up -d --build   (only needed after a Dockerfile change)
+# Runs the STOCK upstream image. It used to build locally (Dockerfile) only to add the
+# Ookla speedtest CLI, which no config has called since 2026-10-22 — so the build is gone
+# and the tag is pinned instead. Bump it deliberately, then deploy EVERY node:
+#   bash telegraf/deploy-telegraf.sh nas-1   (nas-2, server-1, server-3, eos --local too)
 services:
   telegraf:
-    build: .
+    image: telegraf:1.35.2
     container_name: telegraf
     restart: unless-stopped
     network_mode: host
