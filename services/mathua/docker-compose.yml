@@ -1,0 +1,17 @@
+services:
+  mathua:
+    image: mathua:local
+    container_name: mathua
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8080"
+      DATABASE_URL: /data/mathua.db
+    ports:
+      - "8090:8080"
+    volumes:
+      - mathua_data:/data
+
+volumes:
+  mathua_data:
+    name: mathua_data
