@@ -2,6 +2,10 @@ networks:
   forgejo:
     external: false
 
+volumes:
+  forgejo-data:
+    name: forgejo_forgejo-data
+
 services:
   server:
     image: codeberg.org/forgejo/forgejo:14
@@ -13,7 +17,7 @@ services:
     networks:
       - forgejo
     volumes:
-      - ./forgejo:/data
+      - forgejo-data:/data
       - /etc/localtime:/etc/localtime:ro
     ports:
       - '3000:3000'
