@@ -40,7 +40,7 @@
 #   bash /mnt/nas-2-fast-data/config/telegraf/deploy-telegraf.sh nas-1
 # From eos (which has no /mnt/nas-2-fast-data mount) use a clone of nick/infra — e.g.
 # ~/code/infra — and supply the token (there is no .env in a fresh clone):
-#   INFLUXDB_TOKEN=$(printf '%s' '<write token>') ~/code/infra/telegraf/deploy-telegraf.sh nas-1
+#   INFLUXDB_TOKEN=$(printf '%s' '<write token>') ~/code/nick-infra/telegraf/deploy-telegraf.sh nas-1
 # deploy-telegraf.sh takes INFLUXDB_TOKEN from the environment when set, else from the
 # gitignored .env beside it.
 #
