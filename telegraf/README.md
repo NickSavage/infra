@@ -11,13 +11,23 @@
 #   .env                      gitignored: the InfluxDB WRITE token (see below)
 #
 # Node → host map (also encoded in deploy-telegraf.sh)
-#   eos      = 192.168.0.168  desktop      cpu/mem/disk + speedtest
+#   eos      = 192.168.0.168  desktop      cpu/mem/disk
 #   nas-1    = 192.168.0.6    secondary NAS  cpu/mem/disk
 #   nas-2    = 192.168.0.160  storage box    cpu/mem/disk (big shares via override)
-#   server-1 = 192.168.0.93   primary NAS    cpu/mem/disk + speedtest
+#   server-1 = 192.168.0.93   primary NAS    cpu/mem/disk
 #                            + prometheus scrapes of jellyfin and uptime-kuma
 #                            + http_response health of the zettel mail service
-#   server-3 = 192.168.0.20   app server     cpu/mem/disk + speedtest
+#   server-3 = 192.168.0.20   app server     cpu/mem/disk
+#
+# The Ookla speedtest input was REMOVED from all three configs that had it
+# (eos, server-1, server-3) on 2026-10-22: [[inputs.exec]] runs at the agent
+# interval, so it was firing every ~1-2 min (~45 runs/hour/node, ~3300/day
+# fleet-wide), Ookla was answering "Limit reached", and no dashboard panel or
+# alert rule ever read the `speedtest` measurement.
+# NOTE (leftover): the Dockerfile still installs the CLI even though nothing calls
+# it now. Dropping the install — or the custom build entirely, since nothing else
+# needs it (compose would just use `image: telegraf:1.35.2`) — is a deliberate
+# follow-up: it means rebuilding/pulling on all five nodes.
 #
 # WHY THE RUNTIME COPY IS LOCAL (/config/telegraf on each host)
 # These agents report host and NFS health, so they must not depend on the shared
@@ -29,7 +39,8 @@
 # DEPLOY
 #   bash deploy-telegraf.sh <node>            # remote mode: copies over ssh to agent@<host>
 #   bash deploy-telegraf.sh <node> --local    # run ON the target host itself
-#   Add --build when the Dockerfile changed (it bakes in the Ookla speedtest CLI).
+#   Add --build when the Dockerfile changed (today it only adds the Ookla speedtest
+#   CLI, which no config calls any more — see the leftover note above).
 #
 # Run it as the account whose SSH key is authorized on the targets: that is nick@eos,
 # the fleet default. (There is an `agent` account on the servers, but it has no key of
