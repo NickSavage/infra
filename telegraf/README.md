@@ -31,6 +31,13 @@
 #   sudo ./deploy-telegraf.sh <node> --local                    # run ON the target host itself
 #   Add --build when the Dockerfile changed (it bakes in the speedtest CLI).
 #
+# Run it as the `agent` account from a fleet host where you can (agent holds the ssh
+# keys for the other nodes, plus NOPASSWD sudo there). agent cannot read nick-owned
+# .env, so hand it the token through the environment instead:
+#   INFLUXDB_TOKEN=$(sudo -n -u nick sed -n 's/^INFLUXDB_TOKEN=["]*\([^"]*\)["]*$/\1/p' \
+#       /mnt/nas-2-fast-data/config/telegraf/.env) \
+#     /mnt/nas-2-fast-data/config/telegraf/deploy-telegraf.sh nas-1
+#
 # eos is a special case: it has no `agent` account reachable over ssh and nick has
 # no NOPASSWD sudo there, so its copy has to be run by hand on the desktop:
 #   sudo /path/to/telegraf/deploy-telegraf.sh eos --local

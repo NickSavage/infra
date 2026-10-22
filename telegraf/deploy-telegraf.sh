@@ -40,9 +40,14 @@ case "$NODE" in
 esac
 
 [ -f "$SRC/conf/$NODE.conf" ] || { echo "missing $SRC/conf/$NODE.conf" >&2; exit 1; }
-[ -f "$SRC/.env" ]            || { echo "missing $SRC/.env (INFLUXDB_TOKEN=...)" >&2; exit 1; }
-TOKEN=$(sed -n 's/^INFLUXDB_TOKEN=["]*\([^"]*\)["]*$/\1/p' "$SRC/.env")
-[ -n "$TOKEN" ] || { echo "INFLUXDB_TOKEN is empty in $SRC/.env" >&2; exit 1; }
+# Token: from the environment (lets another account run this — e.g. agent, which has
+# the ssh keys but cannot read nick-owned .env), else from the gitignored .env here.
+TOKEN="${INFLUXDB_TOKEN:-}"
+if [ -z "$TOKEN" ]; then
+  [ -f "$SRC/.env" ] || { echo "no $SRC/.env and INFLUXDB_TOKEN not set in the environment" >&2; exit 1; }
+  TOKEN=$(sed -n 's/^INFLUXDB_TOKEN=["]*\([^"]*\)["]*$/\1/p' "$SRC/.env")
+fi
+[ -n "$TOKEN" ] || { echo "INFLUXDB_TOKEN is empty (checked environment and $SRC/.env)" >&2; exit 1; }
 
 STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
 install -m 644 "$SRC/Dockerfile"          "$STAGE/Dockerfile"
