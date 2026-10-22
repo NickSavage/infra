@@ -61,11 +61,17 @@ fi
 
 COMPOSE_ARGS="up -d"; [ "$BUILD" -eq 1 ] && COMPOSE_ARGS="up -d --build"
 
+# `docker compose up -d` does NOT recreate a container when only the CONTENT of a
+# bind-mounted file changed (telegraf.conf) — the compose config hash is unchanged, so
+# telegraf would keep running the OLD config until something restarts it. Both branches
+# capture the deployed conf's hash first and restart afterwards if it changed.
+
 echo "== $NODE ($HOST) ← $SRC"
 if [ "$LOCAL" -eq 1 ]; then
   SUDO=""
   [ "$(id -u)" -eq 0 ] || SUDO="sudo"
   $SUDO mkdir -p "$DEST"
+  OLDCONF=$($SUDO md5sum "$DEST/telegraf.conf" 2>/dev/null | cut -d' ' -f1)
   $SUDO install -o root -g root -m 644 "$STAGE/Dockerfile"         "$DEST/Dockerfile"
   $SUDO install -o root -g root -m 644 "$STAGE/docker-compose.yml" "$DEST/docker-compose.yml"
   $SUDO install -o root -g root -m 644 "$STAGE/telegraf.conf"      "$DEST/telegraf.conf"
@@ -74,7 +80,12 @@ if [ "$LOCAL" -eq 1 ]; then
   if [ -f "$STAGE/docker-compose.override.yml" ]; then
     $SUDO install -o root -g root -m 644 "$STAGE/docker-compose.override.yml" "$DEST/docker-compose.override.yml"
   fi
+  NEWCONF=$($SUDO md5sum "$DEST/telegraf.conf" | cut -d' ' -f1)
   ( cd "$DEST" && $SUDO docker compose $COMPOSE_ARGS )
+  if [ -n "$OLDCONF" ] && [ "$OLDCONF" != "$NEWCONF" ]; then
+    echo "   telegraf.conf changed -> docker restart telegraf to reload it"
+    $SUDO docker restart telegraf
+  fi
   $SUDO docker ps --filter name=telegraf --format '   {{.Names}}  {{.Status}}'
 else
   [ "$SSH" -eq 1 ] || { echo "node $NODE has no ssh path — re-run with --local on that host" >&2; exit 1; }
@@ -85,6 +96,7 @@ else
   ssh $SSH_OPTS "agent@$HOST" "
     set -e
     sudo mkdir -p $DEST
+    OLDCONF=\$(sudo md5sum $DEST/telegraf.conf 2>/dev/null | cut -d' ' -f1)
     sudo install -o root -g root -m 644 /tmp/tg-deploy/Dockerfile         $DEST/Dockerfile
     sudo install -o root -g root -m 644 /tmp/tg-deploy/docker-compose.yml $DEST/docker-compose.yml
     sudo install -o root -g root -m 644 /tmp/tg-deploy/telegraf.conf      $DEST/telegraf.conf
@@ -94,7 +106,12 @@ else
       sudo install -o root -g root -m 644 /tmp/tg-deploy/docker-compose.override.yml $DEST/docker-compose.override.yml
     fi
     rm -rf /tmp/tg-deploy
+    NEWCONF=\$(sudo md5sum $DEST/telegraf.conf | cut -d' ' -f1)
     cd $DEST && sudo docker compose $COMPOSE_ARGS
+    if [ -n \"\$OLDCONF\" ] && [ \"\$OLDCONF\" != \"\$NEWCONF\" ]; then
+      echo '   telegraf.conf changed -> docker restart telegraf to reload it'
+      sudo docker restart telegraf
+    fi
     sudo docker ps --filter name=telegraf --format '   {{.Names}}  {{.Status}}'
   "
 fi
