@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.https.example
+!telegraf/.env.example
 *secret*
 *.jwt_secret
 *.cookie_secret

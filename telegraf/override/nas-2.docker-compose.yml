@@ -1,0 +1,8 @@
+# nas-2 (.160) only — extra read-only binds so inputs.disk can report the big shares.
+# Copied to the host as docker-compose.override.yml by deploy-telegraf.sh; compose
+# merges volumes by target path, so this adds to (never replaces) the base mounts.
+services:
+  telegraf:
+    volumes:
+      - /mnt/nas-data-4:/mnt/nas-data-4:ro
+      - /mnt/nas-2-fast-data-2:/mnt/nas-2-fast-data-2:ro

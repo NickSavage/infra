@@ -1,0 +1,25 @@
+# Telegraf metric agent — one per node.
+#
+# Source of truth: nick/infra, telegraf/  (this file is copied to each host by
+# deploy-telegraf.sh, together with conf/<node>.conf → telegraf.conf).
+#
+# The custom image (Dockerfile next to this file) bakes in the Ookla speedtest CLI
+# used by the eos/server-1/server-3 configs; a plain image has no /usr/bin/speedtest.
+# Rebuild with: docker compose up -d --build   (only needed after a Dockerfile change)
+services:
+  telegraf:
+    build: .
+    container_name: telegraf
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc:/host/etc:ro
+    environment:
+      - HOST_PROC=/host/proc
+      - HOST_SYS=/host/sys
+      - HOST_ETC=/host/etc
