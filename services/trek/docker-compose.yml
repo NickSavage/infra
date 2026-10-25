@@ -1,6 +1,6 @@
 services:
   app:
-    image: mauriceboe/trek:4
+    image: mauriceboe/trek:5
     container_name: trek
     read_only: true
     security_opt:
@@ -12,7 +12,7 @@ services:
       - SETUID
       - SETGID
     tmpfs:
-      - /tmp:noexec,nosuid,size=64m
+      - /tmp:noexec,nosuid,size=128m
     ports:
       - "3002:3000"
     env_file:
