@@ -59,6 +59,7 @@ services:
     entrypoint: web-entrypoint.sh
     command: ['bin/rails', 'server', '-p', '3000', '-b', '::']
     restart: on-failure
+    stop_grace_period: 60s
     env_file:
       - .env
     environment:
@@ -72,6 +73,11 @@ services:
       APPLICATION_HOSTS: ${APPLICATION_HOSTS:-localhost,::1,127.0.0.1,map.thesavages.ca}
       TIME_ZONE: ${TIME_ZONE:-America/New_York}
       APPLICATION_PROTOCOL: ${APPLICATION_PROTOCOL:-http}
+      # 1.17.0: background jobs run in this container (dawarich_sidekiq removed).
+      # WEB_CONCURRENCY must stay 0 - every extra web process would start its own job threads.
+      SIDEKIQ_EMBEDDED: ${SIDEKIQ_EMBEDDED:-true}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-0}
+      BACKGROUND_PROCESSING_CONCURRENCY: ${BACKGROUND_PROCESSING_CONCURRENCY:-2}
       PROMETHEUS_EXPORTER_ENABLED: ${PROMETHEUS_EXPORTER_ENABLED:-false}
       PROMETHEUS_EXPORTER_HOST: ${PROMETHEUS_EXPORTER_HOST:-0.0.0.0}
       PROMETHEUS_EXPORTER_PORT: ${PROMETHEUS_EXPORTER_PORT:-9394}
@@ -100,61 +106,6 @@ services:
     deploy:
       resources:
         limits:
-          cpus: ${APP_CPU_LIMIT:-0.50}
+          # 1.17.0: raised from 0.50 - this container now runs the background jobs too.
+          cpus: ${APP_CPU_LIMIT:-1.00}
           memory: ${APP_MEMORY_LIMIT:-4G}
-
-  dawarich_sidekiq:
-    image: freikin/dawarich:latest
-    container_name: dawarich_sidekiq
-    volumes:
-      - ./dawarich_public:/var/app/public
-      - ./dawarich_watched:/var/app/tmp/imports/watched
-      - ./dawarich_storage:/var/app/storage
-    networks:
-      - dawarich
-    stdin_open: true
-    tty: true
-    entrypoint: sidekiq-entrypoint.sh
-    command: ['sidekiq']
-    restart: on-failure
-    env_file:
-      - .env
-    environment:
-      RAILS_ENV: ${RAILS_ENV:-development}
-      REDIS_URL: ${REDIS_URL:-redis://dawarich_redis:6379}
-      DATABASE_HOST: ${DATABASE_HOST:-dawarich_db}
-      DATABASE_PORT: ${DATABASE_PORT:-5432}
-      DATABASE_USERNAME: ${DATABASE_USERNAME:-postgres}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-password}
-      DATABASE_NAME: ${DATABASE_NAME:-dawarich_development}
-      APPLICATION_HOSTS: ${APPLICATION_HOSTS:-localhost,::1,127.0.0.1}
-      BACKGROUND_PROCESSING_CONCURRENCY: ${BACKGROUND_PROCESSING_CONCURRENCY:-10}
-      APPLICATION_PROTOCOL: ${APPLICATION_PROTOCOL:-http}
-      PROMETHEUS_EXPORTER_ENABLED: ${PROMETHEUS_EXPORTER_ENABLED:-false}
-      PROMETHEUS_EXPORTER_HOST: ${PROMETHEUS_EXPORTER_HOST_SIDEKIQ:-dawarich_app}
-      PROMETHEUS_EXPORTER_PORT: ${PROMETHEUS_EXPORTER_PORT:-9394}
-      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-"CHANGE_ME"}
-      RAILS_LOG_TO_STDOUT: ${RAILS_LOG_TO_STDOUT:-true}
-      SELF_HOSTED: ${SELF_HOSTED:-true}
-      STORE_GEODATA: ${STORE_GEODATA:-true}
-    logging:
-      driver: "json-file"
-      options:
-        max-size: ${LOG_MAX_SIZE:-100m}
-        max-file: ${LOG_MAX_FILE:-5}
-    healthcheck:
-      test: [ "CMD-SHELL", "pgrep -f sidekiq" ]
-      interval: 10s
-      retries: 30
-      start_period: 30s
-      timeout: 10s
-    depends_on:
-      dawarich_db:
-        condition: service_healthy
-        restart: true
-      dawarich_redis:
-        condition: service_healthy
-        restart: true
-      dawarich_app:
-        condition: service_healthy
-        restart: true
