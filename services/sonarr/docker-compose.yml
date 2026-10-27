@@ -10,6 +10,8 @@ services:
       - ./config:/config
       - /mnt/nas-data-4/tv:/tv #optional
       - /mnt/nas-data-4/downloads:/downloads
+      - /mnt/nas-data-4/nzb:/nzb
+
     ports:
       - 8989:8989
     restart: unless-stopped
