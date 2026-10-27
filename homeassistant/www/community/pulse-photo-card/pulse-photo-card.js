@@ -4,6 +4,8 @@ class PulsePhotoCard extends HTMLElement {
     this._frontLayer = 'a';
     this._currentRaw = undefined;
     this._currentUrl = undefined;
+    this._failedRaw = undefined;
+    this._lastResolveError = undefined;
     this._pendingLoadId = 0;
     this._clockInterval = null;
     this._timeEl = null;
@@ -11,6 +13,8 @@ class PulsePhotoCard extends HTMLElement {
     this._nowPlayingEl = null;
     this._nowPlayingLabelEl = null;
     this._nowPlayingTextEl = null;
+    this._noPhotoNoticeEl = null;
+    this._noPhotoReason = null;
     this._nowPlayingLastText = '';
     this._resolvedNowPlayingEntity = null;
     this._legacyOverlayEl = null;
@@ -26,6 +30,9 @@ class PulsePhotoCard extends HTMLElement {
     this._overlayLastNowPlayingTrigger = null;
     this._overlayActive = false;
     this._overlayLastFetch = 0;
+    // Content signature of the overlay document currently loaded in the iframe, used to
+    // skip reassigning srcdoc when a poll returns the same overlay we are already showing.
+    this._overlaySignature = null;
     this._views = [];
     this._currentViewIndex = -1;
     this._viewTimeoutTimer = null;
@@ -47,6 +54,9 @@ class PulsePhotoCard extends HTMLElement {
     this._viewTransitioning = false;
     this._viewTransitionTimer = null;
     this._editModeActive = false;
+    // Bound event listener references for proper cleanup
+    this._handlePhotoTapBound = null;
+    this._handleOverlayMessageBound = null;
   }
 
   // ============================================================================
@@ -694,31 +704,38 @@ class PulsePhotoCard extends HTMLElement {
     if (hasViews) {
       // Attach to card, but also log for debugging
       this._logToHA('debug', `setting up photo tap handler, views count: ${this._views.length}`);
-      this._card.addEventListener('click', (e) => this._handlePhotoTap(e), true); // Use capture phase
+
+      // Create bound handlers for proper cleanup in disconnectedCallback (only if not already created)
+      if (!this._handlePhotoTapBound) {
+        this._handlePhotoTapBound = (e) => this._handlePhotoTap(e);
+      }
+      if (!this._handleOverlayMessageBound) {
+        this._handleOverlayMessageBound = (e) => this._handleOverlayMessage(e);
+      }
+
+      this._card.addEventListener('click', this._handlePhotoTapBound, true); // Use capture phase
 
       // Also attach to frame element to catch clicks on images
       const frameEl = this.shadowRoot.querySelector('.frame');
       if (frameEl) {
-        frameEl.addEventListener('click', (e) => this._handlePhotoTap(e), true);
+        frameEl.addEventListener('click', this._handlePhotoTapBound, true);
       }
 
       // Attach to view container to handle clicks in views
       if (this._viewContainerEl) {
-        this._viewContainerEl.addEventListener('click', (e) => this._handlePhotoTap(e), true);
+        this._viewContainerEl.addEventListener('click', this._handlePhotoTapBound, true);
       }
 
       // Set up click-through layer handler
       // This layer sits between the card and overlay, catching clicks that don't hit overlay interactive elements
       if (this._clickThroughLayer) {
-        this._clickThroughLayer.addEventListener('click', (e) => {
-          // This will only fire if the click doesn't hit an interactive element in the overlay
-          // because those have pointer-events: auto and will stop propagation
-          this._handlePhotoTap(e);
-        }, true);
+        this._clickThroughLayer.addEventListener('click', this._handlePhotoTapBound, true);
       }
 
       // Set up message listener for overlay iframe clicks
-      window.addEventListener('message', (e) => this._handleOverlayMessage(e));
+      // Remove first to prevent duplicates if setConfig is called multiple times
+      window.removeEventListener('message', this._handleOverlayMessageBound);
+      window.addEventListener('message', this._handleOverlayMessageBound);
     }
 
     this._startClock();
@@ -779,14 +796,27 @@ class PulsePhotoCard extends HTMLElement {
     this._updateEditModeState();
 
     const entity = hass.states?.[this._config.entity];
-    if (entity) {
-      const newRaw = entity.state;
-      if (newRaw && newRaw !== 'unknown' && newRaw !== 'unavailable') {
-        if (newRaw !== this._currentRaw || !this._currentUrl) {
-          this._currentRaw = newRaw;
-          this._loadNewImage(newRaw);
-        }
+    const rawState = entity ? entity.state : null;
+    const hasPhoto = rawState && rawState !== 'unknown' && rawState !== 'unavailable';
+    if (hasPhoto) {
+      // `!this._currentUrl` is what lets a card that has never loaded an image
+      // retry on the next hass push. But a path that FAILS to resolve never sets
+      // _currentUrl, so that same clause re-fires on every subsequent push --
+      // and hass updates arrive many times a second. One unresolvable photo on a
+      // freshly-loaded card therefore produced 142 warnings across three kiosks
+      // inside a single 30-minute window, four of them within 0.6ms. Skipping a
+      // path we have already failed on breaks that loop while still allowing a
+      // retry as soon as the slideshow moves to a different photo.
+      const alreadyFailed = rawState === this._failedRaw;
+      if ((rawState !== this._currentRaw || !this._currentUrl) && !alreadyFailed) {
+        this._currentRaw = rawState;
+        this._loadNewImage(rawState);
       }
+      this._clearNoPhotoNotice();
+    } else {
+      // Entity missing, or its state is empty/unknown/unavailable -> no photo to
+      // show. Instead of failing silently to a black screen, surface why.
+      this._handleMissingPhoto(entity, rawState);
     }
 
     this._updateNowPlaying();
@@ -807,7 +837,14 @@ class PulsePhotoCard extends HTMLElement {
     const resolvedUrl = await this._resolveUrl(rawPath);
 
     if (!resolvedUrl) {
-      this._logToHA('warning', `photo URL resolution failed for: ${rawPath}`);
+      // Record the failure so `set hass` stops re-attempting this same path.
+      this._failedRaw = rawPath;
+      // _resolveUrl puts the underlying cause on this._lastResolveError rather
+      // than only console.error()-ing it: the browser console is invisible from
+      // Home Assistant, so without this the warning says a photo failed and
+      // gives no way at all to find out why.
+      const cause = this._lastResolveError ? ` - ${this._lastResolveError}` : '';
+      this._logToHA('warning', `photo URL resolution failed for: ${rawPath}${cause}`);
       return;
     }
     if (loadId !== this._pendingLoadId) {
@@ -818,11 +855,84 @@ class PulsePhotoCard extends HTMLElement {
       return;
     }
 
+    this._failedRaw = undefined;
     this._logToHA('debug', `loading photo: ${resolvedUrl.substring(0, 100)}...`);
     this._swapImage(resolvedUrl);
   }
 
+  // Called when the configured entity is missing or has no usable photo state
+  // (empty string / unknown / unavailable). Logs the reason once per transition
+  // (set hass fires on every state change, so we must not spam the HA log) and
+  // shows a small on-screen notice so the failure isn't an unexplained black
+  // screen.
+  _handleMissingPhoto(entity, rawState) {
+    const entityId = this._config?.entity || '(unset)';
+    let reason;
+    if (!entity) {
+      reason = `photo entity '${entityId}' was not found in Home Assistant`;
+    } else if (rawState === '' || rawState === null || rawState === undefined) {
+      reason =
+        `photo sensor '${entityId}' is empty — no image was found ` +
+        `(the source folder may be empty or unreadable)`;
+    } else {
+      reason = `photo sensor '${entityId}' is ${rawState}`;
+    }
+
+    if (reason !== this._noPhotoReason) {
+      this._noPhotoReason = reason;
+      this._logToHA('warning', `no photo to display: ${reason}`);
+    }
+    this._showNoPhotoNotice(reason);
+  }
+
+  _ensureNoPhotoNotice() {
+    if (this._noPhotoNoticeEl || !this.shadowRoot) {
+      return this._noPhotoNoticeEl;
+    }
+    const el = document.createElement('div');
+    el.className = 'pulse-no-photo-notice';
+    el.setAttribute('role', 'status');
+    el.style.cssText = [
+      'position:absolute',
+      'left:50%',
+      'bottom:6%',
+      'transform:translateX(-50%)',
+      'max-width:80%',
+      'padding:0.5em 0.9em',
+      'border-radius:0.6em',
+      'background:rgba(0,0,0,0.55)',
+      'color:rgba(255,255,255,0.92)',
+      'font-size:0.9rem',
+      'line-height:1.35',
+      'text-align:center',
+      'z-index:50',
+      'pointer-events:none',
+      'backdrop-filter:blur(2px)',
+    ].join(';');
+    (this._card || this.shadowRoot).appendChild(el);
+    this._noPhotoNoticeEl = el;
+    return el;
+  }
+
+  _showNoPhotoNotice(reason) {
+    const el = this._ensureNoPhotoNotice();
+    if (!el) {
+      return;
+    }
+    el.textContent = `⚠ No photo: ${reason}`;
+    el.style.display = 'block';
+  }
+
+  _clearNoPhotoNotice() {
+    this._noPhotoReason = null;
+    if (this._noPhotoNoticeEl) {
+      this._noPhotoNoticeEl.style.display = 'none';
+    }
+  }
+
   async _resolveUrl(rawPath) {
+    this._lastResolveError = undefined;
+
     if (!rawPath) {
       return null;
     }
@@ -837,7 +947,9 @@ class PulsePhotoCard extends HTMLElement {
         if (resolved?.url) {
           return this._hass.hassUrl(resolved.url);
         }
+        this._lastResolveError = 'resolve_media returned no url';
       } catch (err) {
+        this._lastResolveError = err?.message || err?.error || String(err);
         console.error('pulse-photo-card: failed to resolve media source', err);
         return null;
       }
@@ -1002,6 +1114,19 @@ class PulsePhotoCard extends HTMLElement {
     this._overlayClickBridgeReady = false;
     this._cleanupRenderedCards();
     this._updateOverlayStatus();
+
+    // Remove event listeners to prevent memory leaks on reconnect
+    if (this._handleOverlayMessageBound) {
+      window.removeEventListener('message', this._handleOverlayMessageBound);
+    }
+    if (this._handlePhotoTapBound) {
+      this._card?.removeEventListener('click', this._handlePhotoTapBound, true);
+      this.shadowRoot?.querySelector('.frame')?.removeEventListener('click', this._handlePhotoTapBound, true);
+      this._viewContainerEl?.removeEventListener('click', this._handlePhotoTapBound, true);
+      this._clickThroughLayer?.removeEventListener('click', this._handlePhotoTapBound, true);
+    }
+    this._handlePhotoTapBound = null;
+    this._handleOverlayMessageBound = null;
   }
 
   _startClock() {
@@ -1099,7 +1224,6 @@ class PulsePhotoCard extends HTMLElement {
     if (!this._overlayEnabled) {
       this._overlayUrl = null;
     }
-    const hostname = host || 'none';
     this._logToHA('debug', `overlay config: enabled=${this._overlayEnabled}, url=${this._overlayUrl || 'none'}, refreshEntity=${this._overlayRefreshEntity || 'none'}, pollMs=${this._overlayPollMs}`);
     this._updateOverlayStatus();
   }
@@ -1187,6 +1311,21 @@ class PulsePhotoCard extends HTMLElement {
       }
       const rawHtml = await response.text();
       const overlayHtml = this._injectOverlayClickBridge(rawHtml);
+      const signature = this._overlaySignatureOf(overlayHtml);
+      // Assigning srcdoc tears the overlay document down and builds a new window, which
+      // is expensive (a full re-parse every poll on every kiosk) and destructive: any
+      // state the overlay keeps in its own window is lost. That cost bought nothing
+      // whenever the poll returned what we are already showing, which — measured on a
+      // kiosk — is the common case, since the only byte that differs between two idle
+      // renders is the generated-at timestamp. Real changes (a timer, a ticker price,
+      // a version bump) still differ, so they still swap.
+      if (this._overlayActive && signature === this._overlaySignature) {
+        this._overlayLastFetch = Date.now();
+        this._logToHA('debug', `overlay fetch succeeded (${reason || 'unknown'}), unchanged — keeping current document`);
+        this._updateOverlayStatus();
+        return;
+      }
+      this._overlaySignature = signature;
       this._remoteOverlayFrame.srcdoc = overlayHtml;
       this._overlayClickBridgeReady = false;
       this._overlayClickBridgeFallbackEnabled = false;
@@ -1201,6 +1340,7 @@ class PulsePhotoCard extends HTMLElement {
       console.warn('pulse-photo-card: overlay fetch failed', err);
       this._logOverlayError(url, err, reason);
       this._overlayActive = false;
+      this._overlaySignature = null;
       this._showRemoteOverlay(false);
       this._cancelOverlayClickBridgeFallback();
       this._overlayClickBridgeReady = false;
@@ -1288,6 +1428,21 @@ class PulsePhotoCard extends HTMLElement {
     }
 
     this._updateClickThroughLayer();
+  }
+
+  // Injects a click-bridge script into overlay HTML for iframe-to-parent communication.
+  // Security note: postMessage uses '*' as targetOrigin because the iframe content (from PulseOS)
+  // cannot know the parent window's origin ahead of time. This is the standard pattern for
+  // cross-origin iframe communication. Security is enforced on the receiving end in
+  // _handleOverlayMessage() by validating e.source matches the expected iframe contentWindow.
+  _overlaySignatureOf(html) {
+    if (typeof html !== 'string') {
+      return null;
+    }
+    // data-generated-at is stamped on every render and is the ONLY thing that differs
+    // between two renders of an unchanged overlay, so comparing raw bytes would never
+    // match and the skip above would never fire.
+    return html.replace(/\sdata-generated-at="[^"]*"/, '');
   }
 
   _injectOverlayClickBridge(html) {
@@ -1670,7 +1825,6 @@ class PulsePhotoCard extends HTMLElement {
     }
 
     const isOnPhoto = this._currentViewIndex === -1;
-    const isOnFirstView = this._currentViewIndex === 0;
     const isOnLastView = this._currentViewIndex === this._views.length - 1;
     const isTransitioning = this._viewTransitioning;
 
@@ -1929,8 +2083,12 @@ class PulsePhotoCard extends HTMLElement {
             containerCard.hass = this._hass;
           }
 
-          // Force multiple hass updates to ensure nested cards render
-          // Container cards often need multiple updates to render their nested cards
+          // Force multiple hass updates to ensure nested cards render.
+          // Container cards (vertical-stack, grid, etc.) often have nested cards that render
+          // asynchronously and may not be ready immediately. Different cards initialize at
+          // different speeds depending on their complexity and data dependencies.
+          // The staggered timing (50ms → 1000ms) covers both fast and slow initializers,
+          // ensuring hass is available when each nested card is ready to receive it.
           const updateHass = () => {
             if (containerCard && this._hass) {
               containerCard.hass = this._hass;

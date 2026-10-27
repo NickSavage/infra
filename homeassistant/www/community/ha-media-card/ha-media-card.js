@@ -1,11 +1,54 @@
 /** 
- * Media Card v5.6.6
+ * Media Viewer Card v5.13.0
  */
 
-import { LitElement, html, css } from 'https://unpkg.com/lit@3/index.js?module'
+// Async wrapper for dynamic Lit loading (supports offline mode)
+(async () => {
+  // Default CDN URL for Lit
+  const LIT_CDN_URL = 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js';
 
+  let LitElement, html, css;
+
+  // Check if Lit was preloaded globally (for offline support)
+  if (window.LitElement && window.html && window.css) {
+    console.log('[Media Viewer Card] Using preloaded Lit from window');
+    LitElement = window.LitElement;
+    html = window.html;
+    css = window.css;
+  } else if (window.__LIT_PRELOAD_PROMISE__) {
+    // Preload script is loading Lit - wait for it
+    console.log('[Media Viewer Card] Waiting for Lit preload to complete...');
+    try {
+      await window.__LIT_PRELOAD_PROMISE__;
+      LitElement = window.LitElement;
+      html = window.html;
+      css = window.css;
+      console.log('[Media Viewer Card] Using preloaded Lit from window');
+    } catch (e) {
+      console.error('[Media Viewer Card] Lit preload failed:', e);
+      console.error('[Media Viewer Card] For offline use, check your preload script. See docs/OFFLINE_MODE.md');
+      return;
+    }
+  } else {
+    // Load Lit dynamically from CDN
+    try {
+      const litModule = await import(LIT_CDN_URL);
+      LitElement = litModule.LitElement;
+      html = litModule.html;
+      css = litModule.css;
+      // Also set on window for consistency
+      window.LitElement = LitElement;
+      window.html = html;
+      window.css = css;
+      console.log('[Media Viewer Card] Loaded Lit from CDN');
+    } catch (e) {
+      console.error('[Media Viewer Card] Failed to load Lit:', e);
+      console.error('[Media Viewer Card] For offline use, preload Lit before this card. See docs/OFFLINE_MODE.md');
+      return; // Can't continue without Lit
+    }
+  }
 // Shared utility functions for media detection
-export const MediaUtils = {
+const MediaUtils = {
   detectFileType(filePath) {
     if (!filePath) return null;
     
@@ -31,14 +74,78 @@ export const MediaUtils = {
     
     if (['mp4', 'webm', 'ogg', 'mov', 'm4v'].includes(extension)) {
       return 'video';
-    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic'].includes(extension)) {
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'heif'].includes(extension)) {
       return 'image';
     }
     
     return null;
+  },
+
+  parseTimeOfDay(value) {
+    if (typeof value !== 'string') return null;
+
+    const trimmed = value.trim();
+    const match = trimmed.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (!match) return null;
+
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+
+    return (hours * 60) + minutes;
+  },
+
+  getTimeOfDayMinutes(value) {
+    if (value === null || value === undefined || value === '') return null;
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      const timeMatch = trimmed.match(/(?:T|\s|^)(\d{1,2}):(\d{2})(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?$/);
+      if (timeMatch) {
+        const extractedTime = `${timeMatch[1]}:${timeMatch[2]}`;
+        return MediaUtils.parseTimeOfDay(extractedTime);
+      }
+    }
+
+    if (typeof value === 'number') {
+      const date = new Date(value > 9999999999 ? value : value * 1000);
+      return (date.getHours() * 60) + date.getMinutes();
+    }
+
+    if (value instanceof Date) {
+      return (value.getHours() * 60) + value.getMinutes();
+    }
+
+    if (typeof value === 'string') {
+      const normalized = value.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+      const parsed = new Date(normalized);
+      if (!isNaN(parsed.getTime())) {
+        return (parsed.getHours() * 60) + parsed.getMinutes();
+      }
+    }
+
+    return null;
+  },
+
+  matchesTimeOfDayRange(value, timeStart, timeEnd) {
+    if (!timeStart && !timeEnd) return true;
+
+    const startMinutes = MediaUtils.parseTimeOfDay(timeStart);
+    const endMinutes = MediaUtils.parseTimeOfDay(timeEnd);
+    const currentMinutes = MediaUtils.getTimeOfDayMinutes(value);
+
+    if (startMinutes === null && endMinutes === null) return true;
+    if (currentMinutes === null) return false;
+    if (startMinutes === null) return currentMinutes <= endMinutes;
+    if (endMinutes === null) return currentMinutes >= startMinutes;
+    if (startMinutes === endMinutes) return true;
+    if (startMinutes < endMinutes) {
+      return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+    }
+
+    return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
   }
 };
-
 
 /**
  * V5 Core Infrastructure Classes
@@ -97,6 +204,51 @@ class MediaProvider {
    */
   resume() {
     this.isPaused = false;
+  }
+
+  /**
+   * V5.6.7: Check if file exists using media_index service (lightweight filesystem check)
+   * Shared by all providers that use media_index backend
+   * @param {Object} mediaItem - Media item with path or URI
+   * @returns {Promise<boolean|null>} true if exists, false if not, null if unavailable
+   */
+  async checkFileExists(mediaItem) {
+    try {
+      const entityId = this.config?.media_index?.entity_id;
+      if (!entityId) {
+        // No media_index entity configured
+        return null;
+      }
+
+      const uri = mediaItem?.media_source_uri || mediaItem?.media_content_id;
+      const path = mediaItem?.path;
+
+      if (!uri && !path) {
+        return null;
+      }
+
+      // Call media_index.check_file_exists service
+      const wsCall = {
+        type: 'call_service',
+        domain: 'media_index',
+        service: 'check_file_exists',
+        service_data: {
+          media_source_uri: uri,
+          file_path: path
+        },
+        return_response: true
+      };
+      
+      if (entityId) {
+        wsCall.target = { entity_id: entityId };
+      }
+      
+      const response = await this.hass.callWS(wsCall);
+      return response?.response?.exists === true;
+    } catch (error) {
+      // Service doesn't exist (old media_index version) or other error
+      return null;
+    }
   }
 
   /**
@@ -283,8 +435,12 @@ class MediaProvider {
       /(\d{4})-(\d{2})-(\d{2})[_T\s](\d{2})[:-](\d{2})[:-](\d{2})/,
       // YYYY-MM-DD format (date only)
       /(\d{4})-(\d{2})-(\d{2})/,
-      // YYYYMMDD format (date only, 8 consecutive digits)
-      /(\d{8})/,
+      // UNIX Timestamp (10-digit, standalone) - MUST come before 8-digit to avoid (\d{8}) consuming
+      // the first 8 digits of a 10-digit number (e.g. 1772236849-camera.mp4)
+      /\b(\d{10})\b/,
+      // YYYYMMDD format (date only, 8 consecutive digits) - word boundary prevents matching
+      // substrings of longer digit sequences like UNIX timestamps
+      /\b(\d{8})\b/,
       // DD-MM-YYYY format (date only)
       /(\d{2})-(\d{2})-(\d{4})/
     ];
@@ -304,6 +460,10 @@ class MediaProvider {
             hour = parseInt(ts.substring(8, 10));
             minute = parseInt(ts.substring(10, 12));
             second = parseInt(ts.substring(12, 14));
+          }
+          // Handle 10-digit UNIX Timestamp
+          else if (match[1] && match[1].length === 10) {
+            return new Date(Number(match[1]) * 1000);
           }
           // Handle 8-digit date (YYYYMMDD)
           else if (match[1] && match[1].length === 8) {
@@ -496,6 +656,135 @@ class MediaProvider {
   }
 
   /**
+   * V5.7: Compile glob patterns to regex for path exclusion
+   * Called once at config load time for performance
+   * @param {string[]} patterns - Array of glob patterns from excluded_paths config
+   * @returns {Object[]} Array of compiled pattern objects { pattern, regex, isRecursive }
+   */
+  static compileExcludedPathPatterns(patterns) {
+    if (!patterns || !Array.isArray(patterns) || patterns.length === 0) {
+      return [];
+    }
+    
+    return patterns
+      .filter(p => p && typeof p === 'string' && p.trim().length > 0)
+      .map(pattern => {
+        // Normalize: convert backslashes to forward slashes, strip trailing slash
+        let normalized = pattern.replace(/\\/g, '/').replace(/\/+$/, '');
+        
+        // Detect if pattern is recursive (ends with /**)
+        const isRecursive = normalized.endsWith('/**');
+        
+        // Build regex from glob pattern
+        // 1. Escape regex special chars (except * and ?)
+        let regexStr = normalized
+          .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+          // 2. Convert ** to placeholder, then * to single-segment match, then restore **
+          .replace(/\*\*/g, '{{GLOBSTAR}}')
+          .replace(/\*/g, '[^/]*')
+          .replace(/\?/g, '[^/]')
+          .replace(/\{\{GLOBSTAR\}\}/g, '.*');
+        
+        // For recursive patterns ending in /**, match the folder itself OR any subfolder
+        // Use (?:$|/) suffix to enforce a full path segment boundary
+        // e.g. "Burst/**" must match "/Burst" but NOT "/BurstPhotos"
+        if (isRecursive) {
+          regexStr = regexStr.replace(/\/\.\*$/, '(?:$|/)');
+        }
+        
+        // Anchor pattern based on how it starts:
+        //   /Pattern  → starts with / → segment-boundary match (leading / is notation, NOT a strict root anchor)
+        //              "/Screenshots" matches at ANY depth that has a "Screenshots" segment,
+        //              e.g. both "/Photos/Screenshots" and "/Vacations/Europe/Screenshots".
+        //              Use a longer path ("/PhotoLibrary/Screenshots") to narrow the match.
+        //   **/Patt   → starts with ** → no prefix (greedy .* handles any prefix)
+        //   Pattern   → relative name → match at any path segment boundary
+        if (normalized.startsWith('/')) {
+          // Strip leading / then apply same segment-boundary anchor as relative patterns
+          regexStr = regexStr.replace(/^\//, '');
+          regexStr = '(?:^|/)' + regexStr;
+        } else if (!normalized.startsWith('**')) {
+          // Relative pattern: match at any path segment boundary
+          regexStr = '(?:^|/)' + regexStr;
+        }
+        // Globstar (**) patterns: no prefix needed, leading .* handles any prefix
+        
+        // End anchor: for non-recursive, must end at a full segment boundary
+        if (!isRecursive) {
+          regexStr = regexStr + '$';
+        }
+        
+        return {
+          pattern: pattern,  // Original pattern for logging
+          regex: new RegExp(regexStr, 'i'),  // Case-insensitive
+          isRecursive: isRecursive
+        };
+      });
+  }
+  
+  /**
+   * V5.7: Check if a file path matches any excluded path pattern
+   * @param {string} itemPath - Full path to the media file
+   * @param {Object[]} compiledPatterns - Array from compileExcludedPathPatterns()
+   * @returns {{ excluded: boolean, matchedPattern: string|null }} Exclusion result
+   */
+  static matchesExcludedPath(itemPath, compiledPatterns) {
+    if (!itemPath || !compiledPatterns || compiledPatterns.length === 0) {
+      return { excluded: false, matchedPattern: null };
+    }
+    
+    // Normalize path: convert backslashes, decode URI encoding
+    let normalizedPath = itemPath.replace(/\\/g, '/');
+    try {
+      normalizedPath = decodeURIComponent(normalizedPath);
+    } catch (e) {
+      // Keep original if decode fails
+    }
+    
+    // Extract folder path (dirname) - we match against folder, not filename
+    const lastSlash = normalizedPath.lastIndexOf('/');
+    const folderPath = lastSlash > 0 ? normalizedPath.substring(0, lastSlash) : normalizedPath;
+    
+    // Test against each compiled pattern
+    for (const compiled of compiledPatterns) {
+      if (compiled.regex.test(folderPath)) {
+        return { excluded: true, matchedPattern: compiled.pattern };
+      }
+    }
+    
+    return { excluded: false, matchedPattern: null };
+  }
+  
+  /**
+   * V5.7: Generate human-readable description of exclusion pattern behavior
+   * Used for INFO logging at card initialization
+   * @param {string} pattern - Original glob pattern
+   * @param {boolean} isRecursive - Whether pattern ends with /**
+   * @returns {string} Description of matching behavior
+   */
+  static describeExclusionPattern(pattern, isRecursive) {
+    // Detect pattern type
+    const startsWithGlobstar = pattern.startsWith('**/');
+    const containsWildcard = pattern.includes('*') || pattern.includes('?');
+
+    if (startsWithGlobstar) {
+      // **/FolderName or **/FolderName/**
+      const folderPart = pattern.replace(/^\*\*\//, '').replace(/\/\*\*$/, '');
+      if (isRecursive) {
+        return `any "${folderPart}" folder, recursive`;
+      } else {
+        return `any "${folderPart}" folder, exact only - child subfolders will not be excluded`;
+      }
+    } else if (isRecursive) {
+      return 'folder and all subfolders';
+    } else if (containsWildcard) {
+      return 'wildcard pattern - matches any folder segment at any depth';
+    } else {
+      return 'exact folder only - child subfolders will not be excluded';
+    }
+  }
+
+  /**
    * Serialize provider state for reconnection
    * Override in subclass to save provider-specific state
    */
@@ -513,7 +802,6 @@ class MediaProvider {
     this.isPaused = data.isPaused || false;
   }
 }
-
 /**
  * MediaIndexHelper - Shared utility for media_index integration
  * V5: Provides unified metadata fetching for all providers
@@ -581,7 +869,7 @@ class MediaIndexHelper {
           location_name: exif.location_name,
           
           // Geocoding status - infer from presence of data
-          has_coordinates: !!(exif.latitude && exif.longitude),
+          has_coordinates: exif.latitude != null && exif.longitude != null,
           is_geocoded: !!(exif.location_city || exif.location_state || exif.location_country),
           
           // Camera info (from nested exif object)
@@ -591,6 +879,12 @@ class MediaIndexHelper {
           // User flags (from nested exif object, convert 0/1 to boolean)
           is_favorited: exif.is_favorited === 1 || response.is_favorited === 1,
           marked_for_edit: false, // Not in get_file_metadata response
+          
+          // Burst group metadata (written by update_burst_metadata on burst panel exit)
+          // burst_favorites: JSON array of filesystem paths of favorited items in the burst group
+          // burst_count: total number of items in the burst group
+          burst_favorites: exif.burst_favorites || null,
+          burst_count: exif.burst_count || null,
           
           // File info from top level
           filename: response.filename,
@@ -631,9 +925,9 @@ class MediaIndexHelper {
       location_country_code: item.location_country_code,
       location_name: item.location_name,
       
-      // Geocoding status
-      has_coordinates: item.has_coordinates || false,
-      is_geocoded: item.is_geocoded || false,
+      // Geocoding status — compute from raw data to handle DB flag inconsistencies
+      has_coordinates: item.latitude != null && item.longitude != null,
+      is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
       
       // Camera info
       camera_make: item.camera_make,
@@ -645,7 +939,6 @@ class MediaIndexHelper {
     };
   }
 }
-
 
 /**
  * SingleMediaProvider - Provider for single image/video
@@ -700,7 +993,6 @@ class SingleMediaProvider extends MediaProvider {
   }
 }
 
-
 /**
  * FOLDER PROVIDER - Wraps SubfolderQueue for folder slideshow
  */
@@ -714,11 +1006,13 @@ class FolderProvider extends MediaProvider {
     this.cardAdapter = {
       config: this._adaptConfigForV4(),
       hass: hass,
+      _cardId: card?._cardId || 'unknown-card', // V5.8: Forward card ID so SubfolderQueue logs show correct card
       _debugMode: !!this.config.debug_mode,  // Controlled via YAML config
       _backgroundPaused: false,
       _log: (...args) => {
         if (this.config.debug_mode) {
-          console.log('[FolderProvider]', ...args);
+          const cardId = this.card?._cardId || 'unknown-card';
+          console.log(`[FolderProvider:${cardId}]`, ...args);
         }
       },
       
@@ -731,7 +1025,7 @@ class FolderProvider extends MediaProvider {
         // Extract filename from the full path and get extension  
         const fileName = filePath.split('/').pop() || filePath;
         const extension = this._getFileExtension(fileName);
-        const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(extension);
+        const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'heif'].includes(extension);
         // Reduced logging - only log 0.1% of files (1 in 1000)
         if (Math.random() < 0.001) {
           this._log('📄', fileName);
@@ -739,6 +1033,15 @@ class FolderProvider extends MediaProvider {
         return isMedia;
       }
     };
+  }
+
+  /**
+   * Forwards the empty-result reason ('filtered' | 'empty_collection' | null) from whichever
+   * underlying media_index-backed provider is active, so the card can distinguish a
+   * legitimate empty-filter result from a real initialization failure.
+   */
+  get emptyReason() {
+    return this.sequentialProvider?.emptyReason || this.mediaIndexProvider?.emptyReason || null;
   }
 
   _adaptConfigForV4() {
@@ -776,7 +1079,10 @@ class FolderProvider extends MediaProvider {
         max_shown_items_history: this.config.slideshow_window || 1000,
         background_scan: true
       },
-      suppress_subfolder_logging: false  // TEMP: Force logging to see what's happening
+      suppress_subfolder_logging: false,  // TEMP: Force logging to see what's happening
+      // V5.8: Pass compiled excluded path patterns so SubfolderQueue can filter items
+      // Source from card._excludedPathPatterns (not config) - config must stay as plain data
+      _excludedPathPatterns: this.card?._excludedPathPatterns || []
     };
   }
 
@@ -800,7 +1106,7 @@ class FolderProvider extends MediaProvider {
       if (useMediaIndex) {
         // Full sequential mode with database ordering
         this.cardAdapter._log('Using SequentialMediaIndexProvider for ordered queries');
-        this.sequentialProvider = new SequentialMediaIndexProvider(this.config, this.hass);
+        this.sequentialProvider = new SequentialMediaIndexProvider(this.config, this.hass, this.card);
         const success = await this.sequentialProvider.initialize();
         
         if (!success) {
@@ -869,16 +1175,19 @@ class FolderProvider extends MediaProvider {
         this.cardAdapter._log('Using MediaIndexProvider for discovery');
         this.mediaIndexProvider = new MediaIndexProvider(this.config, this.hass, this.card);
         const success = await this.mediaIndexProvider.initialize();
-        
-        if (!success) {
-          // V5.3: NEVER fallback silently - always show error when Media Index explicitly enabled
-          const filters = this.config.filters || {};
-          const hasFilters = filters.favorites || filters.date_range?.start || filters.date_range?.end;
           
-          if (hasFilters) {
-            console.error('[FolderProvider] ❌ Media Index returned no items due to active filters');
-            console.error('[FolderProvider] 💡 Adjust your filters or set use_media_index_for_discovery: false');
-            throw new Error('No items match filter criteria. Try adjusting your filters.');
+        if (!success) {
+          // V5.3: NEVER fallback silently - always show error when Media Index explicitly enabled.
+          // Rely on the provider's own emptyReason (not a locally re-derived hasFilters check) so
+          // a legitimate empty result — filtered or an empty collection — never gets converted
+          // into a fatal error; only a real service failure (emptyReason still null) should throw.
+          const emptyReason = this.mediaIndexProvider.emptyReason;
+          if (emptyReason === 'filtered' || emptyReason === 'empty_collection') {
+            console.error(`[FolderProvider] ❌ Media Index returned no items (${emptyReason})`);
+            if (emptyReason === 'filtered') {
+              console.error('[FolderProvider] 💡 Adjust your filters or set use_media_index_for_discovery: false');
+            }
+            return false;
           } else {
             console.error('[FolderProvider] ❌ Media Index initialization failed');
             console.error('[FolderProvider] 💡 Check Media Index entity exists and is populated, or set use_media_index_for_discovery: false');
@@ -1062,11 +1371,12 @@ class FolderProvider extends MediaProvider {
                 location_city: exif.location_city,
                 location_state: exif.location_state,
                 location_country: exif.location_country,
+                location_country_code: exif.location_country_code,
                 location_name: exif.location_name,
                 latitude: exif.latitude,
                 longitude: exif.longitude,
-                has_coordinates: exif.has_coordinates || false,
-                is_geocoded: exif.is_geocoded || false
+                has_coordinates: exif.latitude != null && exif.longitude != null,
+                is_geocoded: !!(exif.is_geocoded || exif.location_city || exif.location_state || exif.location_country)
               };
               this.cardAdapter._log('✅ Enriched item with media_index metadata:', item.metadata);
             } else {
@@ -1100,19 +1410,45 @@ class FolderProvider extends MediaProvider {
     return null;
   }
 
-  // V5.6.6: Delegate file existence check to wrapped provider (MediaIndexProvider only)
+  // V5.6.7: Delegate file existence check to wrapped provider
+  // All providers inherit checkFileExists from base MediaProvider class
   async checkFileExists(mediaItem) {
-    // Only MediaIndexProvider implements this - delegate if available
-    if (this.mediaIndexProvider && typeof this.mediaIndexProvider.checkFileExists === 'function') {
+    // Delegate to whichever provider is active (both inherit from MediaProvider)
+    if (this.mediaIndexProvider) {
       return await this.mediaIndexProvider.checkFileExists(mediaItem);
     }
     
-    if (this.sequentialProvider && typeof this.sequentialProvider.checkFileExists === 'function') {
+    if (this.sequentialProvider) {
       return await this.sequentialProvider.checkFileExists(mediaItem);
     }
     
-    // SubfolderQueue discovers files from disk, no validation needed
+    // SubfolderQueue doesn't use media_index, no validation available
     return null;
+  }
+
+  // V5.6.8: Delegate 404 file exclusion to wrapped provider
+  // This allows the card to tell the provider to exclude files that 404
+  excludeFile(path) {
+    if (!path) return;
+    
+    this.cardAdapter._log(`🚫 FolderProvider.excludeFile: ${path}`);
+    
+    // Delegate to whichever provider is active
+    if (this.sequentialProvider && typeof this.sequentialProvider.excludeFile === 'function') {
+      this.sequentialProvider.excludeFile(path);
+    }
+    
+    if (this.mediaIndexProvider && typeof this.mediaIndexProvider.excludeFile === 'function') {
+      this.mediaIndexProvider.excludeFile(path);
+    }
+    
+    // For SubfolderQueue, track excluded files locally
+    if (this.subfolderQueue) {
+      if (!this._excludedFiles) {
+        this._excludedFiles = new Set();
+      }
+      this._excludedFiles.add(path);
+    }
   }
 
   // Query for files newer than the given date (for queue refresh feature)
@@ -1154,10 +1490,62 @@ class FolderProvider extends MediaProvider {
     this.cardAdapter._log('⚠️ No rescan method available for this provider');
     return { queueChanged: false };
   }
+  
+  /**
+   * V5.6.8: Check for new files since the slideshow started
+   * Delegates to underlying provider (SequentialMediaIndexProvider or SubfolderQueue)
+   * Returns array of new items to prepend to navigation queue
+   */
+  async checkForNewFiles() {
+    // Delegate to SequentialMediaIndexProvider (database-backed)
+    if (this.sequentialProvider && typeof this.sequentialProvider.checkForNewFiles === 'function') {
+      this.cardAdapter._log('🔍 Delegating checkForNewFiles to SequentialMediaIndexProvider');
+      return await this.sequentialProvider.checkForNewFiles();
+    }
+    
+    // Delegate to SubfolderQueue (filesystem mode)
+    if (this.subfolderQueue && typeof this.subfolderQueue.checkForNewFiles === 'function') {
+      this.cardAdapter._log('🔍 Delegating checkForNewFiles to SubfolderQueue');
+      return await this.subfolderQueue.checkForNewFiles();
+    }
+    
+    this.cardAdapter._log('⚠️ No checkForNewFiles implementation for this provider');
+    return [];
+  }
+  
+  /**
+   * V5.6.8: Reset provider to beginning for fresh query
+   * Used when wrapping slideshow to start over with fresh data
+   */
+  async reset() {
+    this.cardAdapter._log('🔄 Resetting FolderProvider');
+    
+    // Delegate to SequentialMediaIndexProvider (database-backed)
+    if (this.sequentialProvider && typeof this.sequentialProvider.reset === 'function') {
+      this.cardAdapter._log('🔄 Delegating reset to SequentialMediaIndexProvider');
+      return await this.sequentialProvider.reset();
+    }
+    
+    // For SubfolderQueue (filesystem), reinitialize
+    if (this.subfolderQueue) {
+      this.cardAdapter._log('🔄 Re-scanning filesystem via SubfolderQueue');
+      // Clear and reinitialize the queue
+      this.subfolderQueue.queue = [];
+      this.subfolderQueue.shownItems = new Set();
+      return await this.subfolderQueue.initialize();
+    }
+    
+    // For MediaIndexProvider (random mode), reinitialize
+    if (this.mediaIndexProvider && typeof this.mediaIndexProvider.reset === 'function') {
+      this.cardAdapter._log('🔄 Delegating reset to MediaIndexProvider');
+      return await this.mediaIndexProvider.reset();
+    }
+    
+    this.cardAdapter._log('⚠️ No reset implementation for this provider');
+    return false;
+  }
 
 }
-
-
 
 /**
  * SUBFOLDER QUEUE - Essential V4 code copied for v5
@@ -1253,7 +1641,9 @@ class SubfolderQueue {
       return;
     }
     
-    console.log('📂 SubfolderQueue:', ...args);
+    // V5.6.10: Include card ID in logs for multi-card debugging
+    const cardId = this.card?._cardId || 'unknown-card';
+    console.log(`📂 SubfolderQueue[${cardId}]:`, ...args);
   }
 
   _checkPathChange() {
@@ -1587,14 +1977,46 @@ class SubfolderQueue {
             return (file.title || '').toLowerCase();
           };
           
+          // Helper to get numeric value for comparison
+          // If key is purely numeric, use it directly
+          // If alphanumeric, try to extract date using MediaProvider helper
+          const getNumericValue = (key) => {
+            if (/^\d+$/.test(key)) {
+              return BigInt(key);
+            }
+            // Try extracting date from the key (which is filename/title)
+            const dateFromKey = MediaProvider.extractDateFromFilename(key, this.card.config);
+            if (dateFromKey) {
+              return BigInt(dateFromKey.getTime());
+            }
+            return null;
+          };
+          
           this.queue.sort((a, b) => {
             const keyA = getTimestampForSort(a);
             const keyB = getTimestampForSort(b);
             
+            const numA = getNumericValue(keyA);
+            const numB = getNumericValue(keyB);
+            
+            // Files with dates should come before files without dates
+            if (numA !== null && numB === null) return -1;
+            if (numA === null && numB !== null) return 1;
+            
+            // Both have numeric dates - compare them
+            if (numA !== null && numB !== null) {
+              if (orderDirection === 'desc') {
+                return numB > numA ? 1 : numB < numA ? -1 : 0;
+              } else {
+                return numA > numB ? 1 : numA < numB ? -1 : 0;
+              }
+            }
+            
+            // Both are non-date filenames - use localeCompare for alphabetical
             if (orderDirection === 'desc') {
-              return keyB.localeCompare(keyA); // Newest first
+              return keyB.localeCompare(keyA);
             } else {
-              return keyA.localeCompare(keyB); // Oldest first
+              return keyA.localeCompare(keyB);
             }
           });
           
@@ -1808,19 +2230,42 @@ class SubfolderQueue {
           const keyA = getTimestampForSort(a);
           const keyB = getTimestampForSort(b);
           
-          // Detect if keys are timestamps (14 digits) or filenames (alphabetical)
-          const isTimestampA = /^\d{14}$/.test(keyA);
-          const isTimestampB = /^\d{14}$/.test(keyB);
+          // Helper to get numeric value for comparison
+          // If key is purely numeric, use it directly
+          // If alphanumeric, try to extract date using MediaProvider helper
+          const getNumericValue = (key, file) => {
+            if (/^\d+$/.test(key)) {
+              return BigInt(key);
+            }
+            // Try extracting date from the key (which is filename/title)
+            const dateFromKey = MediaProvider.extractDateFromFilename(key, this.card.config);
+            if (dateFromKey) {
+              return BigInt(dateFromKey.getTime());
+            }
+            return null;
+          };
           
-          // Files with timestamps should always come before files without timestamps
-          if (isTimestampA && !isTimestampB) return -1; // A (has date) before B (no date)
-          if (!isTimestampA && isTimestampB) return 1;  // B (has date) before A (no date)
+          const numA = getNumericValue(keyA, a);
+          const numB = getNumericValue(keyB, b);
           
-          // Both have timestamps OR both are filenames - sort normally
+          // Files with dates should come before files without dates
+          if (numA !== null && numB === null) return -1;
+          if (numA === null && numB !== null) return 1;
+          
+          // Both have numeric dates - compare them
+          if (numA !== null && numB !== null) {
+            if (orderDirection === 'desc') {
+              return numB > numA ? 1 : numB < numA ? -1 : 0; // Newest first
+            } else {
+              return numA > numB ? 1 : numA < numB ? -1 : 0; // Oldest first
+            }
+          }
+          
+          // Both are non-date filenames - use localeCompare for alphabetical
           if (orderDirection === 'desc') {
-            return keyB.localeCompare(keyA); // Newest first (higher timestamp = more recent)
+            return keyB.localeCompare(keyA);
           } else {
-            return keyA.localeCompare(keyB); // Oldest first (lower timestamp = older)
+            return keyA.localeCompare(keyB);
           }
         });
         
@@ -1883,17 +2328,50 @@ class SubfolderQueue {
         let sortedSubfolders;
         if (isSequentialMode) {
           // Sequential mode: Sort folders by name (descending = newest first, ascending = oldest first)
-          // Most camera/NVR folders use date-based naming (YYYYMMDD, YYYY-MM-DD, etc.)
+          // Most camera/NVR folders use date-based naming (YYYYMMDD, YYYY-MM-DD, YYYY/M/D, etc.)
           sortedSubfolders = [...subfolders].sort((a, b) => {
-            const nameA = (a.title || a.media_content_id.split('/').pop() || '').toLowerCase();
-            const nameB = (b.title || b.media_content_id.split('/').pop() || '').toLowerCase();
+            const nameA = (a.title || a.media_content_id.split('/').pop() || '');
+            const nameB = (b.title || b.media_content_id.split('/').pop() || '');
+            
+            // Extract numeric parts for proper date comparison
+            // Handles: "2026/1/12", "2026-01-12", "20260112", etc.
+            const extractDateValue = (name) => {
+              // Try to extract all numbers from the name
+              const numbers = name.match(/\d+/g);
+              if (!numbers) return 0;
+              
+              // If looks like YYYYMMDD (8 digits), parse directly
+              if (numbers.length === 1 && numbers[0].length === 8) {
+                return parseInt(numbers[0], 10);
+              }
+              
+              // If we have year/month/day parts (e.g., "2026/1/12" or "2026-01-12")
+              if (numbers.length >= 3) {
+                const year = parseInt(numbers[0], 10);
+                const month = parseInt(numbers[1], 10);
+                const day = parseInt(numbers[2], 10);
+                // Create sortable number: YYYYMMDD
+                return year * 10000 + month * 100 + day;
+              }
+              
+              // If we have just one number (e.g., day folder "12" inside month folder)
+              if (numbers.length === 1) {
+                return parseInt(numbers[0], 10);
+              }
+              
+              // Fallback: join all numbers
+              return parseInt(numbers.join(''), 10) || 0;
+            };
+            
+            const valueA = extractDateValue(nameA);
+            const valueB = extractDateValue(nameB);
             
             if (orderDirection === 'desc') {
-              // Descending: Z to A, newest dates first (20251123 before 20251122)
-              return nameB.localeCompare(nameA);
+              // Descending: newest dates first (higher values first)
+              return valueB - valueA;
             } else {
-              // Ascending: A to Z, oldest dates first (20251122 before 20251123)
-              return nameA.localeCompare(nameB);
+              // Ascending: oldest dates first (lower values first)
+              return valueA - valueB;
             }
           });
           
@@ -2056,41 +2534,56 @@ class SubfolderQueue {
   // V5: Simplified - just return next item from queue
   // Card manages history/navigation, provider just supplies items
   getNextItem() {
-    // Refill if empty
-    if (this.queue.length === 0) {
-      this.refillQueue();
+    const excludedPatterns = this.card?.config._excludedPathPatterns;
+
+    // Outer retry loop: handles "all shown" case without recursion.
+    // First pass is the normal path; subsequent passes happen after ageOut+refill.
+    const MAX_RETRY_CYCLES = 3;
+    for (let cycle = 0; cycle < MAX_RETRY_CYCLES; cycle++) {
+      // Refill if empty
       if (this.queue.length === 0) {
-        return null;
-      }
-    }
-
-    // Find first unshown item
-    for (let i = 0; i < this.queue.length; i++) {
-      const item = this.queue[i];
-      if (!this.shownItems.has(item.media_content_id)) {
-        this.shownItems.add(item.media_content_id);
-        this.queue.splice(i, 1);
-        
-        // Trigger refill if running low
-        if (this.needsRefill()) {
-          setTimeout(() => this.refillQueue(), 100);
+        this.refillQueue();
+        if (this.queue.length === 0) {
+          return null;
         }
-        
-        return item;
       }
+
+      // Find first unshown item that isn't excluded
+      for (let i = 0; i < this.queue.length; i++) {
+        const item = this.queue[i];
+        if (!this.shownItems.has(item.media_content_id)) {
+          // Check if item matches an excluded path pattern
+          if (excludedPatterns && excludedPatterns.length > 0) {
+            const itemPath = item.media_content_id || item.path || '';
+            const exclusionResult = MediaProvider.matchesExcludedPath(itemPath, excludedPatterns);
+            if (exclusionResult.excluded) {
+              this._log(`🚫 Excluding item matching pattern "${exclusionResult.matchedPattern}":`, itemPath);
+              // Mark as shown so we don't keep checking it
+              this.shownItems.add(item.media_content_id);
+              this.queue.splice(i, 1);
+              i--; // Adjust index since we removed an item
+              continue;
+            }
+          }
+
+          this.shownItems.add(item.media_content_id);
+          this.queue.splice(i, 1);
+
+          // Trigger refill if running low
+          if (this.needsRefill()) {
+            setTimeout(() => this.refillQueue(), 100);
+          }
+
+          return item;
+        }
+      }
+
+      // All items in current queue have been shown/excluded - age out and try again
+      this.ageOutShownItems();
+      this.refillQueue();
+      // Loop continues to retry with freshly refilled queue
     }
 
-    // All items in queue have been shown - age out and try again
-    this.ageOutShownItems();
-    this.refillQueue();
-    
-    if (this.queue.length > 0) {
-      const item = this.queue[0];
-      this.shownItems.add(item.media_content_id);
-      this.queue.shift();
-      return item;
-    }
-    
     return null;
   }
 
@@ -2533,13 +3026,93 @@ class SubfolderQueue {
     this._log(`🔍 getFilesNewerThan: Found ${newerFiles.length} files newer than ${dateThreshold.toISOString()} (checked ${this.queue.length} files in queue)`);
     return newerFiles;
   }
+  
+  /**
+   * V5.6.8: Check for new files since the slideshow started
+   * Rescans the folder tree and returns any files not seen in the original scan.
+   * This is more expensive than the database version but works for filesystem mode.
+   * @returns {Array} New items to prepend to navigation queue
+   */
+  async checkForNewFiles() {
+    // Store the files we knew about at the start
+    if (!this._knownFilesAtStart) {
+      // First call - record current state as baseline
+      this._knownFilesAtStart = new Set(this.queue.map(item => item.media_content_id));
+      this._log(`📝 Recorded ${this._knownFilesAtStart.size} known files as baseline for periodic refresh`);
+      return [];
+    }
+    
+    this._log('🔄 Checking for new files (filesystem mode)...');
+    
+    // Save current queue state
+    const originalQueue = [...this.queue];
+    const originalShown = new Set(this.shownItems);
+    
+    try {
+      // Do a fresh scan
+      this.queue = [];
+      this.shownItems.clear();
+      this._scanCancelled = false;
+      this.isScanning = true;
+      this.discoveryInProgress = true;
+      
+      await this.quickScan();
+      
+      // Find new files (in fresh scan but not in baseline)
+      const newFiles = this.queue.filter(item => 
+        !this._knownFilesAtStart.has(item.media_content_id)
+      );
+      
+      this._log(`📊 Scan found ${this.queue.length} total files, ${newFiles.length} are new since start`);
+      
+      // Restore original queue (don't disrupt current playback)
+      this.queue = originalQueue;
+      this.shownItems = originalShown;
+      
+      if (newFiles.length > 0) {
+        // Update baseline to include new files
+        newFiles.forEach(item => this._knownFilesAtStart.add(item.media_content_id));
+        this._log(`✅ Found ${newFiles.length} new files during periodic refresh`);
+      }
+      
+      return newFiles;
+      
+    } catch (error) {
+      this._log('⚠️ checkForNewFiles failed:', error);
+      // Restore original state on error
+      this.queue = originalQueue;
+      this.shownItems = originalShown;
+      return [];
+    } finally {
+      this.isScanning = false;
+      this.discoveryInProgress = false;
+    }
+  }
+  
+  /**
+   * V5.6.8: Reset the queue for fresh start
+   * Called when wrapping the slideshow to reload latest files
+   */
+  async reset() {
+    this._log('🔄 Resetting SubfolderQueue');
+    
+    // KEEP the known files baseline across resets - this prevents duplicates
+    // when periodic refresh runs after a wrap. The baseline represents
+    // "files known at session start" and should persist across loops.
+    // (Was: this._knownFilesAtStart = null - caused duplicates)
+    
+    // Clear queue and reinitialize
+    this.queue = [];
+    this.shownItems.clear();
+    
+    return await this.initialize();
+  }
 }
 
 /**
  * MediaCard - Main card component
  * Phase 2: Now uses provider pattern to display media
  */
-
 
 /**
  * MEDIA INDEX PROVIDER - Database-backed random media queries
@@ -2563,58 +3136,15 @@ class MediaIndexProvider extends MediaProvider {
     this._entitySubscriptions = []; // Track subscribed entity IDs
     this._entityUnsubscribe = null; // Unsubscribe function
     this._lastFilterValues = {}; // Track last known filter values for change detection
+
+    // Set by initialize() when it returns false due to an empty (not erroneous) result —
+    // 'filtered' (active filters excluded everything) or 'empty_collection' (no filters,
+    // nothing in the library). Lets the card distinguish this from a real init failure.
+    this.emptyReason = null;
   }
   
-  /**
-   * V5.6.6: Check if file exists using media_index service (lightweight filesystem check)
-   * @param {Object} mediaItem - Media item with path or URI
-   * @returns {Promise<boolean|null>} true if exists, false if not, null if unavailable
-   */
-  async checkFileExists(mediaItem) {
-    try {
-      const entityId = this.config?.media_index?.entity_id;
-      if (!entityId) {
-        // No media_index entity configured
-        return null;
-      }
-
-      const uri = mediaItem?.media_source_uri || mediaItem?.media_content_id;
-      const path = mediaItem?.path;
-
-      if (!uri && !path) {
-        this._log('⚠️ No URI or path for file existence check');
-        return null;
-      }
-
-    // Call media_index.check_file_exists service using WebSocket (same pattern as get_random_items)
-    const wsCall = {
-      type: 'call_service',
-      domain: 'media_index',
-      service: 'check_file_exists',
-      service_data: {
-        media_source_uri: uri,
-        file_path: path
-      },
-      return_response: true
-    };
-    
-    // Target specific media_index entity if configured
-    if (entityId) {
-      wsCall.target = {
-        entity_id: entityId
-      };
-    }
-    
-    const response = await this.hass.callWS(wsCall);
-
-    this._log('📁 File existence check result:', response);
-    return response?.response?.exists === true;
-    } catch (error) {
-      // Service doesn't exist (old media_index version) or other error
-      this._log('⚠️ File existence check failed (service unavailable):', error.message);
-      return null; // Fallback to preload
-    }
-  }
+  // V5.6.7: checkFileExists is inherited from base MediaProvider class
+  // No need to duplicate - all providers share the same media_index.check_file_exists service
   
   /**
    * Clean up subscriptions when provider is destroyed
@@ -2635,9 +3165,11 @@ class MediaIndexProvider extends MediaProvider {
     
     const filters = this.config.filters || {};
     const activeFilters = [];
+    const timeRange = this._getTimeRangeFilter(filters);
     
     if (filters.favorites) activeFilters.push('favorites');
     if (filters.date_range?.start || filters.date_range?.end) activeFilters.push('date_range');
+    if (timeRange.start || timeRange.end) activeFilters.push('time_range');
     
     const stats = {
       queue_size: this.queue.length,
@@ -2646,7 +3178,9 @@ class MediaIndexProvider extends MediaProvider {
       filter_config: {
         favorites: filters.favorites || null,
         date_from: filters.date_range?.start || null,
-        date_to: filters.date_range?.end || null
+        date_to: filters.date_range?.end || null,
+        time_from: timeRange.start || null,
+        time_to: timeRange.end || null
       },
       timestamp: new Date().toISOString()
     };
@@ -2654,7 +3188,11 @@ class MediaIndexProvider extends MediaProvider {
     this._log('📊 Queue stats:', stats);
     
     // V5.3: Fire event through Home Assistant event bus (shows in Developer Tools)
-    if (this.hass && this.hass.connection && this.hass.connection.sendMessage) {
+    // V5.6.8: Skip for non-admin users - fire_event requires admin permissions
+    // This prevents HA from logging "Unauthorized" errors for dashboard-only users
+    if (this.hass?.user?.is_admin === false) {
+      this._log('⏭️ Skipping fire_event (non-admin user)');
+    } else if (this.hass && this.hass.connection && this.hass.connection.sendMessage) {
       try {
         const promise = this.hass.connection.sendMessage({
           type: 'fire_event',
@@ -2665,11 +3203,13 @@ class MediaIndexProvider extends MediaProvider {
         // Only add catch handler if sendMessage returned a promise
         if (promise && typeof promise.catch === 'function') {
           promise.catch(err => {
-            console.warn('[MediaIndexProvider] Failed to fire queue stats event:', err);
+            // Silently ignore - this is optional functionality
+            this._log('⚠️ fire_event failed (may require admin):', err?.message || err);
           });
         }
       } catch (err) {
-        console.warn('[MediaIndexProvider] Error firing queue stats event:', err);
+        // Silently ignore - this is optional functionality
+        this._log('⚠️ fire_event failed (may require admin):', err?.message || err);
       }
     }
     
@@ -2686,8 +3226,57 @@ class MediaIndexProvider extends MediaProvider {
 
   _log(...args) {
     if (this.config?.debug_mode) {
-      console.log('[MediaIndexProvider]', ...args);
+      // V5.6.10: Include card ID in logs for multi-card debugging
+      const cardId = this.card?._cardId || 'unknown-card';
+      console.log(`[MediaIndexProvider:${cardId}]`, ...args);
     }
+  }
+
+  _getTimeRangeFilter(filters = this.config.filters || {}) {
+    const normalizeTime = (value) => {
+      if (typeof value !== 'string') return value || null;
+      const normalized = value.trim().split(':').slice(0, 2).join(':');
+      return MediaUtils.parseTimeOfDay(normalized) !== null ? normalized : value;
+    };
+    return {
+      start: normalizeTime(filters.time_range?.start || filters.time_start || null),
+      end: normalizeTime(filters.time_range?.end || filters.time_end || null)
+    };
+  }
+
+  _applyTimeRangeFilter(items, timeStart, timeEnd) {
+    if (!timeStart && !timeEnd) return items;
+
+    return items.filter(item => MediaUtils.matchesTimeOfDayRange(
+      item.date_taken || item.created_time,
+      timeStart,
+      timeEnd
+    ));
+  }
+
+  _estimateRandomSampleCount(count, timeStart, timeEnd) {
+    if (!timeStart && !timeEnd) return count;
+
+    const startMinutes = MediaUtils.parseTimeOfDay(timeStart);
+    const endMinutes = MediaUtils.parseTimeOfDay(timeEnd);
+    let activeMinutes = 1440;
+
+    if (startMinutes !== null && endMinutes !== null) {
+      if (startMinutes === endMinutes) {
+        activeMinutes = 1440;
+      } else if (startMinutes < endMinutes) {
+        activeMinutes = (endMinutes - startMinutes) + 1;
+      } else {
+        activeMinutes = (1440 - startMinutes) + endMinutes + 1;
+      }
+    } else if (startMinutes !== null) {
+      activeMinutes = 1440 - startMinutes;
+    } else if (endMinutes !== null) {
+      activeMinutes = endMinutes + 1;
+    }
+
+    const coverage = Math.max(activeMinutes / 1440, 0.1);
+    return Math.min(Math.max(count, Math.ceil(count / coverage)), 500);
   }
 
   /**
@@ -2709,6 +3298,10 @@ class MediaIndexProvider extends MediaProvider {
     // Check if it looks like an entity_id (contains a dot)
     if (!configValue.includes('.')) {
       // Direct string value (e.g., date string "2024-01-01")
+      if (expectedType === 'time') {
+        const normalizedTime = configValue.trim().split(':').slice(0, 2).join(':');
+        return MediaUtils.parseTimeOfDay(normalizedTime) !== null ? normalizedTime : configValue;
+      }
       return configValue;
     }
     
@@ -2730,6 +3323,11 @@ class MediaIndexProvider extends MediaProvider {
       case 'input_datetime':
         // Can be date-only or datetime
         // state.state format: "2024-01-01" or "2024-01-01 12:00:00"
+        if (expectedType === 'time') {
+          const timeValue = state.state.split(/[T ]/)[1] || state.state;
+          const normalizedTime = timeValue.split(':').slice(0, 2).join(':');
+          return MediaUtils.parseTimeOfDay(normalizedTime) !== null ? normalizedTime : null;
+        }
         const dateValue = state.state.split(' ')[0]; // Extract date part
         return dateValue || null;
       
@@ -2746,9 +3344,12 @@ class MediaIndexProvider extends MediaProvider {
           return state.state === 'on' || state.state === 'true' || state.state === '1';
         } else if (expectedType === 'number') {
           return parseFloat(state.state) || null;
-        } else {
-          return state.state || null;
-        }
+         } else if (expectedType === 'time') {
+           const normalizedTime = state.state.split(':').slice(0, 2).join(':');
+           return MediaUtils.parseTimeOfDay(normalizedTime) !== null ? normalizedTime : null;
+         } else {
+           return state.state || null;
+         }
       
       default:
         this._log(`⚠️ Unsupported entity domain for filter: ${domain}`);
@@ -2758,6 +3359,7 @@ class MediaIndexProvider extends MediaProvider {
 
   async initialize() {
     this._log('Initializing...');
+    this.emptyReason = null;
     
     // Check if media_index is configured
     if (!MediaProvider.isMediaIndexActive(this.config)) {
@@ -2784,20 +3386,26 @@ class MediaIndexProvider extends MediaProvider {
       const hasFavoritesFilter = filters.favorites === true || (typeof filters.favorites === 'string' && filters.favorites.trim().length > 0);
       const hasDateFromFilter = filters.date_range?.start && filters.date_range.start.trim().length > 0;
       const hasDateToFilter = filters.date_range?.end && filters.date_range.end.trim().length > 0;
-      const hasFilters = hasFavoritesFilter || hasDateFromFilter || hasDateToFilter;
+      const timeRange = this._getTimeRangeFilter(filters);
+      const hasTimeFromFilter = typeof timeRange.start === 'string' && timeRange.start.trim().length > 0;
+      const hasTimeToFilter = typeof timeRange.end === 'string' && timeRange.end.trim().length > 0;
+      const hasFilters = hasFavoritesFilter || hasDateFromFilter || hasDateToFilter || hasTimeFromFilter || hasTimeToFilter;
       
       if (hasFilters) {
         // Filters are active - this is expected behavior, not an error
         console.warn('[MediaIndexProvider] ⚠️ No items match filter criteria:', {
           favorites: filters.favorites || false,
-          date_range: filters.date_range || 'none'
+          date_range: filters.date_range || 'none',
+          time_range: timeRange.start || timeRange.end ? timeRange : 'none'
         });
         console.warn('[MediaIndexProvider] 💡 Try adjusting your filters or verify files match criteria');
         // Still return false to prevent display, but with clear user feedback
+        this.emptyReason = 'filtered';
         return false;
       } else {
         // No filters but still no items - collection might be empty
         console.warn('[MediaIndexProvider] ⚠️ No items in collection (no filters active)');
+        this.emptyReason = 'empty_collection';
         return false;
       }
     }
@@ -2817,8 +3425,16 @@ class MediaIndexProvider extends MediaProvider {
   /**
    * V5.3: Subscribe to entity state changes for dynamic filter updates
    * Detects filter entity IDs and subscribes to their state changes
+   * V5.6.8: Gracefully handles non-admin users who can't subscribe to state_changed
    */
   async _subscribeToFilterEntities() {
+    // V5.6.8: Skip for non-admin users - subscribeEvents('state_changed') requires admin permissions
+    // This prevents HA from logging "Unauthorized" errors for dashboard-only users
+    if (this.hass?.user?.is_admin === false) {
+      this._log('⏭️ Skipping entity subscription (non-admin user - filter changes require page refresh)');
+      return;
+    }
+    
     const filters = this.config.filters || {};
     const entityIds = [];
     
@@ -2831,6 +3447,13 @@ class MediaIndexProvider extends MediaProvider {
     }
     if (filters.date_range?.end && typeof filters.date_range.end === 'string' && filters.date_range.end.includes('.')) {
       entityIds.push(filters.date_range.end);
+    }
+    const timeRange = this._getTimeRangeFilter(filters);
+    if (timeRange.start && typeof timeRange.start === 'string' && timeRange.start.includes('.')) {
+      entityIds.push(timeRange.start);
+    }
+    if (timeRange.end && typeof timeRange.end === 'string' && timeRange.end.includes('.')) {
+      entityIds.push(timeRange.end);
     }
     
     if (entityIds.length === 0) {
@@ -2845,7 +3468,9 @@ class MediaIndexProvider extends MediaProvider {
     this._lastFilterValues = {
       favorites: await this._resolveFilterValue(filters.favorites, 'boolean'),
       date_from: await this._resolveFilterValue(filters.date_range?.start, 'date'),
-      date_to: await this._resolveFilterValue(filters.date_range?.end, 'date')
+      date_to: await this._resolveFilterValue(filters.date_range?.end, 'date'),
+      time_from: await this._resolveFilterValue(timeRange.start, 'time'),
+      time_to: await this._resolveFilterValue(timeRange.end, 'time')
     };
     
     this._log('📝 Initial filter values:', this._lastFilterValues);
@@ -2883,6 +3508,16 @@ class MediaIndexProvider extends MediaProvider {
               filters.date_range?.end, 
               'date',
               filters.date_range?.end === changedEntityId ? newState : null
+            ),
+            time_from: await this._resolveFilterValue(
+              timeRange.start,
+              'time',
+              timeRange.start === changedEntityId ? newState : null
+            ),
+            time_to: await this._resolveFilterValue(
+              timeRange.end,
+              'time',
+              timeRange.end === changedEntityId ? newState : null
             )
           };
           
@@ -2892,7 +3527,9 @@ class MediaIndexProvider extends MediaProvider {
           const filtersChanged = 
             currentFilters.favorites !== this._lastFilterValues.favorites ||
             currentFilters.date_from !== this._lastFilterValues.date_from ||
-            currentFilters.date_to !== this._lastFilterValues.date_to;
+            currentFilters.date_to !== this._lastFilterValues.date_to ||
+            currentFilters.time_from !== this._lastFilterValues.time_from ||
+            currentFilters.time_to !== this._lastFilterValues.time_to;
           
           if (filtersChanged) {
             this._log('✨ Filter values changed, reloading queue:', currentFilters);
@@ -2957,7 +3594,9 @@ class MediaIndexProvider extends MediaProvider {
       
       this._log('✅ Subscribed to filter entity state changes (filtering in callback)');
     } catch (error) {
-      console.warn('[MediaIndexProvider] Failed to subscribe to entity changes:', error);
+      // V5.6.8: Silently handle - this is optional functionality for dynamic filter updates
+      // Non-admin users will need to refresh page when filters change
+      this._log('⚠️ Entity subscription failed (filter changes require page refresh):', error?.message || error);
     }
   }
 
@@ -3049,6 +3688,7 @@ class MediaIndexProvider extends MediaProvider {
     }
     
     // Return next item from queue
+    // Note: excluded path patterns are filtered in _queryMediaIndex(), so queue items are pre-validated
     if (this.queue.length > 0) {
       const item = this.queue.shift();
       
@@ -3076,12 +3716,15 @@ class MediaIndexProvider extends MediaProvider {
           location_city: item.location_city,
           location_state: item.location_state,
           location_country: item.location_country,
+          location_country_code: item.location_country_code,
           location_name: item.location_name,
-          has_coordinates: item.has_coordinates || false,
-          is_geocoded: item.is_geocoded || false,
+          has_coordinates: item.latitude != null && item.longitude != null,
+          is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
           latitude: item.latitude,
           longitude: item.longitude,
-          is_favorited: item.is_favorited || false
+          is_favorited: item.is_favorited || false,
+          burst_count: item.burst_count || null,
+          burst_favorites: item.burst_favorites || null
         }
       };
     }
@@ -3134,12 +3777,19 @@ class MediaIndexProvider extends MediaProvider {
       const favoritesOnly = await this._resolveFilterValue(filters.favorites, 'boolean');
       const dateFrom = await this._resolveFilterValue(filters.date_range?.start, 'date');
       const dateTo = await this._resolveFilterValue(filters.date_range?.end, 'date');
+      const timeRange = this._getTimeRangeFilter(filters);
+      const timeFrom = await this._resolveFilterValue(timeRange.start, 'time');
+      const timeTo = await this._resolveFilterValue(timeRange.end, 'time');
+      const sampleCount = this._estimateRandomSampleCount(count, timeFrom, timeTo);
       
-      if (favoritesOnly || dateFrom || dateTo) {
+      if (favoritesOnly || dateFrom || dateTo || timeFrom || timeTo) {
         this._log('🔍 Active filters:', {
           favorites_only: favoritesOnly,
           date_from: dateFrom,
-          date_to: dateTo
+          date_to: dateTo,
+          time_from: timeFrom,
+          time_to: timeTo,
+          sample_count: sampleCount
         });
       }
       
@@ -3149,7 +3799,7 @@ class MediaIndexProvider extends MediaProvider {
         domain: 'media_index',
         service: 'get_random_items',
         service_data: {
-          count: count,
+          count: sampleCount,
           folder: folderFilter,
           recursive: this.config.folder?.recursive !== false,
           // Use configured media type preference
@@ -3162,7 +3812,10 @@ class MediaIndexProvider extends MediaProvider {
           // V5 FEATURE: Priority new files - prepend recently indexed files to results
           // Note: Recently indexed = newly discovered by scanner, not necessarily new files
           priority_new_files: priorityNewFiles,
-          new_files_threshold_seconds: thresholdSeconds
+          new_files_threshold_seconds: thresholdSeconds,
+          // V5.9: Backend-side burst filtering — excludes non-favorite burst members
+          // when index_burst_groups has been run. Items with no burst data pass through unchanged.
+          auto_select_burst_favorite: this.config.auto_select_burst_favorite || false
         },
         return_response: true
       };
@@ -3180,23 +3833,46 @@ class MediaIndexProvider extends MediaProvider {
         console.warn('[MediaIndexProvider] 📤 WebSocket call:', JSON.stringify(wsCall, null, 2));
       }
       
-      const wsResponse = await this.hass.callWS(wsCall);
-      
-      // V4 CODE: Log the raw response (only in debug mode)
-      if (this.config?.debug_queue_mode) {
-        console.warn('[MediaIndexProvider] 📥 WebSocket response:', JSON.stringify(wsResponse, null, 2));
-      }
+      const shouldRetryForTimeRange = !!(timeFrom || timeTo);
+      const excludedPatterns = this.card?._excludedPathPatterns;
+      const seenMediaIds = new Set();
+      const collectedItems = [];
+      let attempts = 0;
+      let stagnantAttempts = 0;
+      const maxAttempts = shouldRetryForTimeRange ? 5 : 1;
+      const retryCountStep = Math.max(1, Math.ceil(count / 4));
 
-      // V4 CODE: WebSocket response can be wrapped in different ways
-      // - { response: { items: [...] } }  (standard WebSocket format)
-      // - { service_response: { items: [...] } }  (REST API format)
-      // Try both formats for maximum compatibility
-      const response = wsResponse?.response || wsResponse?.service_response || wsResponse;
-
-      if (response && response.items && Array.isArray(response.items)) {
-        this._log('✅ Received', response.items.length, 'items from media_index');
+      while (collectedItems.length < count && attempts < maxAttempts && stagnantAttempts < 2) {
+        attempts++;
+        const currentSampleCount = !shouldRetryForTimeRange ? sampleCount :
+          (sampleCount >= 500
+            ? Math.max(count, 500 - ((attempts - 1) * retryCountStep))
+            : Math.min(500, sampleCount + ((attempts - 1) * retryCountStep)));
+        wsCall.service_data.count = currentSampleCount;
+        const wsResponse = await this.hass.callWS(wsCall);
         
-        // V4 CODE: Filter out excluded files (moved to _Junk/_Edit) AND unsupported formats BEFORE processing
+        // V4 CODE: Log the raw response (only in debug mode)
+        if (this.config?.debug_queue_mode) {
+          console.warn('[MediaIndexProvider] 📥 WebSocket response:', JSON.stringify(wsResponse, null, 2));
+        }
+
+        // V4 CODE: WebSocket response can be wrapped in different ways
+        // - { response: { items: [...] } }  (standard WebSocket format)
+        // - { service_response: { items: [...] } }  (REST API format)
+        // Try both formats for maximum compatibility
+        const response = wsResponse?.response || wsResponse?.service_response || wsResponse;
+
+        if (!response || !response.items || !Array.isArray(response.items)) {
+          console.warn('[MediaIndexProvider] ⚠️ No items in response:', response);
+          return null;
+        }
+
+        this._log(`✅ Received ${response.items.length} items from media_index (attempt ${attempts}/${maxAttempts})`);
+
+        // Track raw DB count BEFORE local path exclusions so _preloadSmallCollection
+        // can use the unfiltered count to determine if the collection is genuinely small
+        this.lastRawQueryCount = response.items.length;
+
         const filteredItems = response.items.filter(item => {
           const isExcluded = this.excludedFiles.has(item.path);
           if (isExcluded) {
@@ -3204,10 +3880,19 @@ class MediaIndexProvider extends MediaProvider {
             return false;
           }
           
+          // V5.7: Also filter by excluded path patterns configured in YAML
+          if (excludedPatterns && excludedPatterns.length > 0) {
+            const exclusionResult = MediaProvider.matchesExcludedPath(item.path, excludedPatterns);
+            if (exclusionResult.excluded) {
+              this._log(`🚫 Path pattern excluded "${exclusionResult.matchedPattern}": ${item.path}`);
+              return false;
+            }
+          }
+          
           // V4 CODE: Filter out unsupported media formats
           const fileName = item.path.split('/').pop() || item.path;
           const extension = fileName.split('.').pop()?.toLowerCase();
-          const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(extension);
+          const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'heif'].includes(extension);
           
           if (!isMedia) {
             this._log(`⏭️ Filtering out unsupported format: ${item.path}`);
@@ -3221,8 +3906,34 @@ class MediaIndexProvider extends MediaProvider {
           this._log(`📝 Filtered ${response.items.length - filteredItems.length} excluded files (${filteredItems.length} remaining)`);
         }
         
-        // V4 CODE: Transform items to include resolved URLs
-        const items = await Promise.all(filteredItems.map(async (item) => {
+        const timeFilteredItems = this._applyTimeRangeFilter(filteredItems, timeFrom, timeTo);
+        if (timeFilteredItems.length < filteredItems.length) {
+          this._log(`🕒 Filtered ${filteredItems.length - timeFilteredItems.length} items by time of day (${timeFilteredItems.length} remaining)`);
+        }
+
+        const uniqueItems = timeFilteredItems.filter(item => {
+          const mediaId = item.media_source_uri || item.path;
+          if (seenMediaIds.has(mediaId)) {
+            return false;
+          }
+          seenMediaIds.add(mediaId);
+          return true;
+        });
+
+        if (uniqueItems.length === 0) {
+          stagnantAttempts++;
+          this._log(`🔁 No new unique time-matched items found on attempt ${attempts} (${stagnantAttempts} stagnant attempt(s))`);
+        } else {
+          stagnantAttempts = 0;
+          collectedItems.push(...uniqueItems);
+        }
+
+        if (response.items.length < currentSampleCount) {
+          break;
+        }
+      }
+
+      const items = await Promise.all(collectedItems.slice(0, count).map(async (item) => {
           // V5 URI: Use media_source_uri for URL resolution when available
           // Backend provides both path (filesystem) and media_source_uri (Media Index v1.1.0+)
           const mediaId = item.media_source_uri || item.path;
@@ -3239,29 +3950,26 @@ class MediaIndexProvider extends MediaProvider {
             location_city: item.location_city,
             location_state: item.location_state,
             location_country: item.location_country,
+            location_country_code: item.location_country_code,
             location_name: item.location_name,
-            // Geocoding status
-            has_coordinates: item.has_coordinates || false,
-            is_geocoded: item.is_geocoded || false,
+            // Geocoding status — compute from raw data to handle DB flag inconsistencies
+            has_coordinates: item.latitude != null && item.longitude != null,
+            is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
             latitude: item.latitude,
             longitude: item.longitude,
             // Favorite status
             is_favorited: item.is_favorited || false
           };
-        }));
-        
-        this._log(`QUERY RESULT: Received ${items.length} items from database`);
-        if (this.config?.debug_mode) {
-          items.slice(0, 3).forEach((item, idx) => {
-            this._log(`Item ${idx}: path="${item.path}", is_favorited=${item.is_favorited}`, item);
-          });
-        }
-        
-        return items;
-      } else {
-        console.warn('[MediaIndexProvider] ⚠️ No items in response:', response);
-        return null;
+      }));
+      
+      this._log(`QUERY RESULT: Received ${items.length} items from database after ${attempts} attempt(s)`);
+      if (this.config?.debug_mode) {
+        items.slice(0, 3).forEach((item, idx) => {
+          this._log(`Item ${idx}: path="${item.path}", is_favorited=${item.is_favorited}`, item);
+        });
       }
+      
+      return items;
     } catch (error) {
       console.error('[MediaIndexProvider] ❌ Error querying media_index:', error);
       return null;
@@ -3288,6 +3996,19 @@ class MediaIndexProvider extends MediaProvider {
     this.excludedFiles.add(path);
   }
 
+  /**
+   * V5.6.8: Reset provider state for fresh query
+   * Clears queue and excluded files, reinitializes
+   */
+  async reset() {
+    this._log('🔄 Resetting MediaIndexProvider');
+    this.queue = [];
+    this.excludedFiles.clear();
+    this.recentFilesExhausted = false;
+    this._consecutiveEmptyResponses = 0;
+    return await this.initialize();
+  }
+
   // Query for new files (for queue refresh feature)
   // For random mode, we don't filter by date but can query with priority_new_files
   async getFilesNewerThan(dateThreshold) {
@@ -3300,11 +4021,8 @@ class MediaIndexProvider extends MediaProvider {
       this._log('🔍 Checking for new files (random mode - using priority_new_files)');
       
       // Query with priority_new_files to get recently indexed files
-      const result = await this._queryMediaIndex({
-        priority_new_files: true,
-        new_files_threshold_seconds: 3600, // Last hour
-        count: 50 // Check first 50 new files
-      });
+      // V5.6.10: Fixed method signature - pass count as first parameter, priority mode as second
+      const result = await this._queryMediaIndex(50, true);
       
       if (result && result.length > 0) {
         this._log(`✅ Found ${result.length} new files`);
@@ -3320,15 +4038,15 @@ class MediaIndexProvider extends MediaProvider {
   }
 }
 
-
 /**
  * SEQUENTIAL MEDIA INDEX PROVIDER - Database-backed ordered queries
  * NEW V5 FEATURE: Sequential mode with cursor-based pagination
  * Uses media_index.get_ordered_files service for deterministic ordering
  */
 class SequentialMediaIndexProvider extends MediaProvider {
-  constructor(config, hass) {
+  constructor(config, hass, card = null) {
     super(config, hass);
+    this.card = card; // V5.7: Reference to card for card ID logging
     this.queue = []; // Internal queue of items from database
     this.queueSize = config.slideshow_window || 100;
     this.excludedFiles = new Set(); // Track excluded files
@@ -3337,18 +4055,93 @@ class SequentialMediaIndexProvider extends MediaProvider {
     this.orderBy = config.folder?.sequential?.order_by || 'date_taken';
     this.orderDirection = config.folder?.sequential?.order_direction || 'desc';
     this.recursive = config.folder?.recursive !== false; // Default true
-    this.lastSeenValue = null; // Cursor for pagination
+    this.lastSeenValue = null; // Cursor for pagination (sort value)
+    this.lastSeenId = null; // Secondary cursor for tie-breaking (row id)
     this.hasMore = true; // Flag to track if more items available
     // Set to true when all items have been paged and no more results are available from the database
     // Prevents further navigation attempts and unnecessary service calls
     this.reachedEnd = false;
     this.disableAutoLoop = false; // V5.3: Prevent auto-loop during pre-load
+    this._dbCleanupWarningShown = false; // Show DB cleanup warning at most once per session
+    // Set by initialize() when it returns false due to an empty (not erroneous) result —
+    // 'filtered' (active filters excluded everything) or 'empty_collection' (no filters,
+    // nothing in the library). Lets the card distinguish this from a real init failure.
+    this.emptyReason = null;
+
+    // Resume from a saved cursor when the user clears a runtime filter — the card stores
+    // the pre-filter cursor in _pendingProviderCursor; we consume it here (once) so that
+    // initialize() queries from where the user left off instead of from the very beginning.
+    if (card?._pendingProviderCursor) {
+      this.lastSeenValue = card._pendingProviderCursor.lastSeenValue;
+      this.lastSeenId    = card._pendingProviderCursor.lastSeenId;
+      card._pendingProviderCursor = null;
+    }
   }
 
   _log(...args) {
     if (this.config?.debug_mode) {
-      console.log('[SequentialMediaIndexProvider]', ...args);
+      // V5.6.10: Include card ID in logs for multi-card debugging
+      const cardId = this.card?._cardId || 'unknown-card';
+      console.log(`[SequentialMediaIndexProvider:${cardId}]`, ...args);
     }
+  }
+
+  _getTimeRangeFilter(filters = this.config.filters || {}) {
+    const normalizeTime = (value) => {
+      if (typeof value !== 'string') return value || null;
+      const normalized = value.trim().split(':').slice(0, 2).join(':');
+      return MediaUtils.parseTimeOfDay(normalized) !== null ? normalized : value;
+    };
+    return {
+      start: normalizeTime(filters.time_range?.start || filters.time_start || null),
+      end: normalizeTime(filters.time_range?.end || filters.time_end || null)
+    };
+  }
+  
+  /**
+   * Convert a date value to Unix timestamp (seconds).
+   * Handles: Unix timestamps, Date objects, ISO strings, EXIF date strings
+   * @param {number|string|Date} value - The date value to convert
+   * @returns {number|null} Unix timestamp in seconds, or null if invalid
+   */
+  _toUnixTimestamp(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    
+    // Already a numeric timestamp
+    if (typeof value === 'number') {
+      // If it looks like milliseconds (13+ digits), convert to seconds
+      return value > 9999999999 ? Math.floor(value / 1000) : value;
+    }
+    
+    // Date object
+    if (value instanceof Date) {
+      return Math.floor(value.getTime() / 1000);
+    }
+    
+    // String - try to parse
+    if (typeof value === 'string') {
+      // Try ISO format or other parseable date strings
+      const parsed = Date.parse(value);
+      if (!isNaN(parsed)) {
+        return Math.floor(parsed / 1000);
+      }
+      
+      // Try EXIF format: "2022:07:09 00:15:41"
+      const exifMatch = value.match(/^(\d{4}):(\d{2}):(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+      if (exifMatch) {
+        const [, year, month, day, hour, min, sec] = exifMatch;
+        const date = new Date(`${year}-${month}-${day}T${hour}:${min}:${sec}`);
+        if (!isNaN(date.getTime())) {
+          return Math.floor(date.getTime() / 1000);
+        }
+      }
+      
+      this._log(`⚠️ Could not parse date string to timestamp: ${value}`);
+    }
+    
+    return null;
   }
 
   async initialize() {
@@ -3356,6 +4149,8 @@ class SequentialMediaIndexProvider extends MediaProvider {
     this._log('Order by:', this.orderBy, this.orderDirection);
     this._log('Recursive:', this.recursive);
     
+    this.emptyReason = null;
+
     // Check if media_index is configured
     if (!MediaProvider.isMediaIndexActive(this.config)) {
       console.warn('[SequentialMediaIndexProvider] Media index not configured');
@@ -3365,12 +4160,41 @@ class SequentialMediaIndexProvider extends MediaProvider {
     // Initial query to fill queue
     const items = await this._queryOrderedFiles();
     
-    if (!items || items.length === 0) {
-      console.warn('[SequentialMediaIndexProvider] No items returned from media_index');
+    if (items === null) {
+      // Service call failed (malformed/unavailable response, or an exception) - a real error
+      console.error('[SequentialMediaIndexProvider] ❌ Media Index service call failed');
+      return false;
+    }
+    
+    if (items.length === 0) {
+      const filters = this.config.filters || {};
+      const timeRange = this._getTimeRangeFilter(filters);
+      const hasFilters = !!(filters.favorites || filters.date_range?.start || filters.date_range?.end ||
+        timeRange.start || timeRange.end);
+      if (hasFilters) {
+        console.warn('[SequentialMediaIndexProvider] ⚠️ No items match filter criteria:', {
+          favorites: filters.favorites || false,
+          date_range: filters.date_range || 'none',
+          time_range: timeRange.start || timeRange.end ? timeRange : 'none'
+        });
+        this.emptyReason = 'filtered';
+      } else {
+        console.warn('[SequentialMediaIndexProvider] No items returned from media_index');
+        this.emptyReason = 'empty_collection';
+      }
       return false;
     }
     
     this.queue = items;
+    
+    // V5.6.8: Store reference to first item for periodic refresh comparison
+    if (items.length > 0) {
+      const firstItem = items[0];
+      this._firstItemAtStart = firstItem.media_source_uri || firstItem.path;
+      this._firstItemDateAtStart = firstItem.date_taken || firstItem.modified_time || 0;
+      this._log('📝 Reference point for periodic refresh:', this._firstItemAtStart);
+    }
+    
     this._log('✅ Initialized with', this.queue.length, 'items');
     return true;
   }
@@ -3402,7 +4226,9 @@ class SequentialMediaIndexProvider extends MediaProvider {
       this.lastSeenValue = null;
       this.reachedEnd = false;
       this.hasMore = true;
-      this.excludedFiles.clear(); // Clear excluded files when looping back
+      // Don't clear 404 exclusions on loop-back — files missing from disk stay missing.
+      // Keeping them in excludedFiles lets _queryOrderedFiles() skip past them efficiently
+      // on the next pass instead of re-fetching the same stale DB entries.
       
       const items = await this._queryOrderedFiles();
       if (items && items.length > 0) {
@@ -3414,28 +4240,41 @@ class SequentialMediaIndexProvider extends MediaProvider {
       }
     }
     
-    // Return next item from queue
+    // Return next item from queue (skip excluded files)
     if (this.queue.length > 0) {
-      const item = this.queue.shift();
+      let item = this.queue.shift();
       
-      // Update cursor for pagination
-      // Store the value of the sort field for this item
-      switch(this.orderBy) {
-        case 'date_taken':
-          this.lastSeenValue = item.date_taken;
-          break;
-        case 'filename':
-          this.lastSeenValue = item.filename;
-          break;
-        case 'path':
-          this.lastSeenValue = item.path;
-          break;
-        case 'modified_time':
-          this.lastSeenValue = item.modified_time;
-          break;
-        default:
-          this.lastSeenValue = item.path;
+      // V5.6.8: Skip excluded files (404s) - keep checking until we find a non-excluded file
+      // Use _isExcluded for normalized path comparison
+      while (item && this._isExcluded(item.path)) {
+        this._log(`⏭️ Skipping excluded file in getNext: ${item.path}`);
+        if (this.queue.length === 0) {
+          if (this.hasMore && !this.reachedEnd) {
+            // Queue drained by 404-skipping before the top-of-function low-water refill fired.
+            // Fetch the next batch now rather than returning null and triggering a cursor reset.
+            this._log('⚠️ Queue empty while skipping excluded files — fetching next batch...');
+            const moreItems = await this._queryOrderedFiles();
+            if (moreItems && moreItems.length > 0) {
+              this.queue.push(...moreItems);
+              item = this.queue.shift();
+              if (!item) break;
+              continue;
+            }
+          }
+          this._log('⚠️ Queue exhausted while skipping excluded files');
+          return null;
+        }
+        item = this.queue.shift();
       }
+      
+      if (!item) {
+        this._log('⚠️ No valid (non-excluded) items left in queue');
+        return null;
+      }
+      
+      // V5.6.8: Cursor is now managed by _queryOrderedFiles() after client-side sort
+      // DO NOT update cursor here - it would overwrite the correct end-of-batch cursor
+      // with the cursor of the item being returned, causing duplicate fetches
       
       // Extract metadata using MediaProvider helper (V5 architecture)
       const pathMetadata = MediaProvider.extractMetadataFromPath(item.path, this.config);
@@ -3447,6 +4286,11 @@ class SequentialMediaIndexProvider extends MediaProvider {
         // V5: Use URI for media_content_id (Media Index v1.1.0+ provides media_source_uri)
         media_content_id: mediaId,
         media_content_type: MediaUtils.detectFileType(item.path) || 'image',
+        title: pathMetadata.filename, // V5.6.8: Add title field for card logging
+        // V5.6.8: Add path and media_source_uri at top level for 404 exclusion
+        path: item.path,
+        media_source_uri: item.media_source_uri,
+        filename: pathMetadata.filename,
         metadata: {
           ...pathMetadata,
           // EXIF data from media_index backend
@@ -3457,9 +4301,10 @@ class SequentialMediaIndexProvider extends MediaProvider {
           location_city: item.location_city,
           location_state: item.location_state,
           location_country: item.location_country,
+          location_country_code: item.location_country_code,
           location_name: item.location_name,
-          has_coordinates: item.has_coordinates || false,
-          is_geocoded: item.is_geocoded || false,
+          has_coordinates: item.latitude != null && item.longitude != null,
+          is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
           latitude: item.latitude,
           longitude: item.longitude,
           is_favorited: item.is_favorited || false
@@ -3467,11 +4312,12 @@ class SequentialMediaIndexProvider extends MediaProvider {
       };
     }
     
-    console.warn('[MediaCard] Sequential queue empty, no items to return');
+    console.warn('[MediaViewerCard] Sequential queue empty, no items to return');
     return null;
   }
 
   // Query ordered files from media_index (similar to _queryMediaIndex but different service)
+  // V5.6.8: Now fetches additional batches if too many items are excluded (404s)
   async _queryOrderedFiles() {
     if (!MediaProvider.isMediaIndexActive(this.config)) {
       console.warn('[SequentialMediaIndexProvider] Media index not configured');
@@ -3501,69 +4347,141 @@ class SequentialMediaIndexProvider extends MediaProvider {
         }
       }
       
-      // Build service data
-      const serviceData = {
-        count: this.queueSize,
-        folder: folderFilter,
-        recursive: this.recursive,
-        file_type: this.config.media_type === 'all' ? undefined : this.config.media_type,
-        order_by: this.orderBy,
-        order_direction: this.orderDirection,
-        // V5 FEATURE: Priority new files - prepend recently indexed files to results
-        // Note: Recently indexed = newly discovered by scanner, not necessarily new files
-        priority_new_files: this.config.folder?.priority_new_files || false,
-        new_files_threshold_seconds: this.config.folder?.new_files_threshold_seconds || 3600
+      // V5.6.8: Use local cursor for this query session (don't modify this.lastSeenValue until getNext)
+      let localCursor = this.lastSeenValue;
+      let localCursorId = this.lastSeenId;  // Secondary cursor for tie-breaking
+      let allFilteredItems = [];
+      // Set when the WebSocket response itself is malformed/unavailable — a real service
+      // failure, as opposed to a well-formed response that simply matched zero items.
+      let serviceFailure = false;
+      let seenPaths = new Set(); // Track paths we've already added to avoid duplicates
+      let iteration = 0;
+
+      // Resolve date range filters from config (supports static dates or HA entity IDs)
+      const _resolveDateFilter = (configValue) => {
+        if (!configValue) return null;
+        if (typeof configValue === 'string' && configValue.includes('.')) {
+          // Entity ID — look up current state
+          const state = this.hass?.states[configValue];
+          const raw = state?.state;
+          if (!raw || raw === 'unknown' || raw === 'unavailable') return null;
+          // Strip time component from ISO-8601 (T separator) or datetime strings (space separator)
+          const dateOnly = raw.split(/[T ]/)[0];
+          return /^\d{4}-\d{2}-\d{2}$/.test(dateOnly) ? dateOnly : null;
+        }
+        // Static value — validate it looks like YYYY-MM-DD before passing to backend
+        if (typeof configValue === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(configValue.split(/[T ]/)[0])) {
+          return configValue.split(/[T ]/)[0];
+        }
+        return configValue;
       };
+      const dateFrom = _resolveDateFilter(this.config.filters?.date_range?.start);
+      const dateTo = _resolveDateFilter(this.config.filters?.date_range?.end);
+      const timeRange = this._getTimeRangeFilter(this.config.filters || {});
+      // Track consecutive batches where ALL items were excluded - used as a safety escape valve.
+      // Resets to 0 whenever a batch yields at least one valid item, so a single large excluded
+      // folder won't halt iteration; only a pathological config (everything excluded) will stop it.
+      let consecutiveAllExcludedBatches = 0;
+      const MAX_CONSECUTIVE_EXCLUDED = 20; // Give up after 20 fully-excluded batches in a row
+      const DB_CLEANUP_WARNING_THRESHOLD = 5; // Warn user after 5 consecutive fully-excluded batches
+      // Overall iteration cap: limits worst-case WebSocket calls when excluded_paths leaves
+      // only a few valid items per batch (not all-excluded, so consecutive counter keeps resetting).
+      // 20 iterations × queueSize items/batch gives a reasonable upper bound on backend load.
+      const MAX_ITERATIONS = 20;
       
-      // Add cursor for pagination (if we've seen items before)
-      if (this.lastSeenValue !== null) {
-        serviceData.after_value = this.lastSeenValue;
-        this._log('🔍 Using cursor (after_value):', this.lastSeenValue);
-      }
+      // Keep fetching batches until we have enough valid items OR database is exhausted
+      while (allFilteredItems.length < this.queueSize && consecutiveAllExcludedBatches < MAX_CONSECUTIVE_EXCLUDED && iteration < MAX_ITERATIONS) {
+        iteration++;
+        
+        // Build service data
+        const serviceData = {
+          count: this.queueSize,
+          folder: folderFilter,
+          recursive: this.recursive,
+          file_type: this.config.media_type === 'all' ? undefined : this.config.media_type,
+          order_by: this.orderBy,
+          order_direction: this.orderDirection,
+          // V5 FEATURE: Priority new files - prepend recently indexed files to results
+          // Note: Recently indexed = newly discovered by scanner, not necessarily new files
+          priority_new_files: this.config.folder?.priority_new_files || false,
+          new_files_threshold_seconds: this.config.folder?.new_files_threshold_seconds || 3600,
+          ...(dateFrom ? { date_from: dateFrom } : {}),
+          ...(dateTo ? { date_to: dateTo } : {}),
+        };
+        
+        // Add compound cursor for pagination (if we've seen items before)
+        // Using (after_value, after_id) handles duplicate sort values correctly
+        if (localCursor !== null) {
+          serviceData.after_value = localCursor;
+          if (localCursorId !== null) {
+            serviceData.after_id = localCursorId;
+          }
+          this._log('🔍 Using cursor:', `after_value=${localCursor}, after_id=${localCursorId}`, `(iteration ${iteration})`);
+        }
       
       // Build WebSocket call
-      const wsCall = {
-        type: 'call_service',
-        domain: 'media_index',
-        service: 'get_ordered_files',
-        service_data: serviceData,
-        return_response: true
-      };
-      
-      // Target specific media_index entity if configured
-      if (this.config.media_index?.entity_id) {
-        wsCall.target = {
-          entity_id: this.config.media_index.entity_id
+        const wsCall = {
+          type: 'call_service',
+          domain: 'media_index',
+          service: 'get_ordered_files',
+          service_data: serviceData,
+          return_response: true
         };
-        this._log('🎯 Targeting entity:', this.config.media_index.entity_id);
-      }
-      
-      // Debug logging
-      if (this.config?.debug_queue_mode) {
-        console.warn('[SequentialMediaIndexProvider] 📤 WebSocket call:', JSON.stringify(wsCall, null, 2));
-      }
-      
-      const wsResponse = await this.hass.callWS(wsCall);
-      
-      if (this.config?.debug_queue_mode) {
-        console.warn('[SequentialMediaIndexProvider] 📥 WebSocket response:', JSON.stringify(wsResponse, null, 2));
-      }
+        
+        // Target specific media_index entity if configured
+        if (this.config.media_index?.entity_id) {
+          wsCall.target = {
+            entity_id: this.config.media_index.entity_id
+          };
+          if (iteration === 1) {
+            this._log('🎯 Targeting entity:', this.config.media_index.entity_id);
+          }
+        }
+        
+        // Debug logging
+        if (this.config?.debug_queue_mode) {
+          console.warn('[SequentialMediaIndexProvider] 📤 WebSocket call:', JSON.stringify(wsCall, null, 2));
+        }
+        
+        const wsResponse = await this.hass.callWS(wsCall);
+        
+        if (this.config?.debug_queue_mode) {
+          console.warn('[SequentialMediaIndexProvider] 📥 WebSocket response:', JSON.stringify(wsResponse, null, 2));
+        }
 
-      // Handle response formats
-      const response = wsResponse?.response || wsResponse?.service_response || wsResponse;
+        // Handle response formats
+        const response = wsResponse?.response || wsResponse?.service_response || wsResponse;
 
-      if (response && response.items && Array.isArray(response.items)) {
-        this._log('✅ Received', response.items.length, 'items from media_index');
+        if (!response || !response.items || !Array.isArray(response.items)) {
+          this._log('⚠️ No items in response - database exhausted');
+          this.hasMore = false;
+          // Only the very first page returning a malformed response indicates a real
+          // service failure; on later pages this is the normal end-of-results signal.
+          if (iteration === 1) serviceFailure = true;
+          break; // Exit loop - no more items available
+        }
+        
+        this._log('✅ Received', response.items.length, 'items from media_index', `(iteration ${iteration})`);
+        if (iteration === 1) {
+          this._log(`📝 Currently ${this.excludedFiles.size} files in exclusion list`);
+        }
         
         // Check if we got fewer items than requested (indicates end of sequence)
         if (response.items.length < this.queueSize) {
-          this._log('📝 Received fewer items than requested - may be at end of sequence');
+          this._log('📝 Received fewer items than requested - at end of sequence');
           this.hasMore = false;
         }
         
-        // Filter excluded files and unsupported formats
+        // Filter excluded files, unsupported formats, AND duplicates from previous batches
         const filteredItems = response.items.filter(item => {
-          const isExcluded = this.excludedFiles.has(item.path);
+          // V5.6.8: Skip duplicates (same item returned in overlapping batches)
+          if (seenPaths.has(item.path)) {
+            this._log(`⏭️ Skipping duplicate from overlapping batch: ${item.path}`);
+            return false;
+          }
+          
+          // V5.6.8: Use _isExcluded for normalized path comparison
+          const isExcluded = this._isExcluded(item.path);
           if (isExcluded) {
             this._log(`⏭️ Filtering out excluded file: ${item.path}`);
             return false;
@@ -3572,78 +4490,181 @@ class SequentialMediaIndexProvider extends MediaProvider {
           // Filter unsupported formats
           const fileName = item.path.split('/').pop() || item.path;
           const extension = fileName.split('.').pop()?.toLowerCase();
-          const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(extension);
+          const isMedia = ['mp4', 'webm', 'ogg', 'mov', 'm4v', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic', 'heif'].includes(extension);
           
           if (!isMedia) {
             this._log(`⏭️ Filtering out unsupported format: ${item.path}`);
             return false;
           }
           
+          // Track this path as seen
+          seenPaths.add(item.path);
           return true;
         });
+        const timeFilteredItems = filteredItems.filter(item => MediaUtils.matchesTimeOfDayRange(
+          item.date_taken || item.created_time,
+          timeRange.start,
+          timeRange.end
+        ));
         
         if (filteredItems.length < response.items.length) {
-          this._log(`📝 Filtered ${response.items.length - filteredItems.length} files (${filteredItems.length} remaining)`);
+          this._log(`📝 Filtered ${response.items.length - filteredItems.length} files (${filteredItems.length} remaining before time filter)`);
+        }
+        if (timeFilteredItems.length < filteredItems.length) {
+          this._log(`🕒 Filtered ${filteredItems.length - timeFilteredItems.length} items by time of day (${timeFilteredItems.length} remaining in this batch)`);
         }
         
-        // CLIENT-SIDE SAFETY: Re-sort items to handle null date_taken gracefully
-        // Backend should already sort correctly, but this prevents issues if:
-        // - Videos have null date_taken but recent modified_time
-        // - Backend fallback logic changes
-        // - Network/caching returns stale data
-        if (this.orderBy === 'date_taken') {
-          filteredItems.sort((a, b) => {
-            // Use date_taken, fallback to modified_time, then created_time
-            const dateA = a.date_taken || a.modified_time || a.created_time || 0;
-            const dateB = b.date_taken || b.modified_time || b.created_time || 0;
-            
-            // Apply direction
-            return this.orderDirection === 'desc' ? dateB - dateA : dateA - dateB;
-          });
-          this._log('🔄 Applied client-side sort by date_taken with fallback to modified_time/created_time');
+        // Add filtered items to our accumulated result
+        allFilteredItems.push(...timeFilteredItems);
+        
+        // Update compound cursor using the LAST item in the batch
+        // The backend now uses (sort_field, id) compound ordering, so using the last item
+        // guarantees we advance past ALL items in this batch, even with duplicate sort values
+        if (response.items.length > 0) {
+          const lastItem = response.items[response.items.length - 1];
+          
+          // Update the sort value cursor
+          // V5.6.8: Use _toUnixTimestamp to ensure date fields are numeric (fixes ISO string errors)
+          switch(this.orderBy) {
+            case 'date_taken':
+              localCursor = this._toUnixTimestamp(lastItem.date_taken) || 
+                            this._toUnixTimestamp(lastItem.modified_time) || 
+                            this._toUnixTimestamp(lastItem.created_time);
+              break;
+            case 'filename':
+              localCursor = lastItem.filename;
+              break;
+            case 'path':
+              localCursor = lastItem.path;
+              break;
+            case 'modified_time':
+              localCursor = this._toUnixTimestamp(lastItem.modified_time);
+              break;
+            default:
+              localCursor = lastItem.path;
+          }
+          
+          // Update the id cursor for tie-breaking
+          localCursorId = lastItem.id;
+          
+          this._log(`📍 Updated compound cursor: value=${localCursor}, id=${localCursorId}`);
         }
         
-        // Transform items to include resolved URLs
-        const items = await Promise.all(filteredItems.map(async (item) => {
-          // V5 URI: Use media_source_uri for URL resolution when available
-          const mediaId = item.media_source_uri || item.path;
-          const resolvedUrl = await this._resolveMediaPath(mediaId);
-          return {
-            ...item,
-            media_content_id: mediaId, // CRITICAL: Add media_content_id for queue validation
-            url: resolvedUrl,
-            path: item.path, // Keep filesystem path for metadata
-            filename: item.filename || item.path.split('/').pop(),
-            folder: item.folder || item.path.substring(0, item.path.lastIndexOf('/')),
-            // EXIF metadata from backend
-            date_taken: item.date_taken,
-            created_time: item.created_time,
-            modified_time: item.modified_time,
-            location_city: item.location_city,
-            location_state: item.location_state,
-            location_country: item.location_country,
-            location_name: item.location_name,
-            has_coordinates: item.has_coordinates || false,
-            is_geocoded: item.is_geocoded || false,
-            latitude: item.latitude,
-            longitude: item.longitude,
-            is_favorited: item.is_favorited || false
-          };
-        }));
-        
-        this._log(`QUERY RESULT: Received ${items.length} ordered items`);
-        if (this.config?.debug_mode) {
-          items.slice(0, 3).forEach((item, idx) => {
-            this._log(`Item ${idx}: path="${item.path}", ${this.orderBy}=${item[this.orderBy]}`);
-          });
+        // Track consecutive fully-excluded batches (all items filtered out)
+        // This is the only escape valve now - keeps going through large excluded folders
+        // but stops if config excludes literally everything in the database
+        const validFromThisBatch = timeFilteredItems.length;
+        if (validFromThisBatch === 0 && response.items.length > 0) {
+          consecutiveAllExcludedBatches++;
+          if (consecutiveAllExcludedBatches >= DB_CLEANUP_WARNING_THRESHOLD && !this._dbCleanupWarningShown) {
+            this._dbCleanupWarningShown = true;
+            const excludedCount = consecutiveAllExcludedBatches * this.queueSize;
+            const warningMsg = `⚠️ Media Index: ${excludedCount}+ results excluded — check excluded_paths config or run cleanup_database if files are missing from disk.`;
+            console.warn(`[SequentialMediaIndexProvider] ${warningMsg}`);
+            this.card?._showToast(warningMsg, 7000);
+          }
+          if (consecutiveAllExcludedBatches >= MAX_CONSECUTIVE_EXCLUDED) {
+            this._log(`⚠️ Stopping after ${MAX_CONSECUTIVE_EXCLUDED} consecutive fully-excluded batches - excluded_paths may be too broad`);
+            break;
+          }
+        } else {
+          consecutiveAllExcludedBatches = 0; // Reset on any progress
         }
         
-        return items;
-      } else {
-        console.warn('[SequentialMediaIndexProvider] ⚠️ No items in response:', response);
-        this.hasMore = false;
-        return null;
+        // If we got enough items OR database is exhausted, exit loop
+        if (allFilteredItems.length >= this.queueSize || !this.hasMore) {
+          break;
+        }
+        
+        this._log(`🔄 Need more items (have ${allFilteredItems.length}, need ${this.queueSize}) - fetching next batch...`);
       }
+
+      if (iteration >= MAX_ITERATIONS && allFilteredItems.length < this.queueSize) {
+        this._log(`⚠️ Stopped after ${MAX_ITERATIONS} iterations with only ${allFilteredItems.length} items - excluded_paths may be excluding most of the database`);
+      }
+      
+      // Now process all accumulated items
+      if (allFilteredItems.length === 0) {
+        this._log('⚠️ No valid items after filtering across all batches');
+        this.hasMore = false;
+        // null = real service failure; [] = well-formed response that matched nothing
+        // (lets initialize() distinguish a filtered/empty result from a genuine failure).
+        return serviceFailure ? null : [];
+      }
+      
+      this._log(`📊 Total items after ${iteration} iteration(s): ${allFilteredItems.length}`);
+        
+      // CLIENT-SIDE SAFETY: Re-sort items to handle null date_taken gracefully
+      // Backend should already sort correctly, but this prevents issues if:
+      // - Videos have null date_taken but recent modified_time
+      // - Backend fallback logic changes
+      // - Network/caching returns stale data
+      if (this.orderBy === 'date_taken') {
+        allFilteredItems.sort((a, b) => {
+          // Use date_taken, fallback to modified_time, then created_time
+          const dateA = a.date_taken || a.modified_time || a.created_time || 0;
+          const dateB = b.date_taken || b.modified_time || b.created_time || 0;
+          
+          // Apply direction
+          return this.orderDirection === 'desc' ? dateB - dateA : dateA - dateB;
+        });
+        this._log('🔄 Applied client-side sort by date_taken with fallback to modified_time/created_time');
+        
+        // V5.6.8: CRITICAL - Update cursor based on LAST item in SORTED array
+        // The cursor must reflect the actual last item we're returning, not the backend's order
+        // Use _toUnixTimestamp to ensure numeric values (fixes ISO string errors)
+        if (allFilteredItems.length > 0) {
+          const lastSortedItem = allFilteredItems[allFilteredItems.length - 1];
+          localCursor = this._toUnixTimestamp(lastSortedItem.date_taken) || 
+                        this._toUnixTimestamp(lastSortedItem.modified_time) || 
+                        this._toUnixTimestamp(lastSortedItem.created_time);
+          localCursorId = lastSortedItem.id;
+          this._log(`📍 Updated cursor AFTER client-side sort: value=${localCursor}, id=${localCursorId}`);
+        }
+      }
+      
+      // Transform items to include resolved URLs
+      const items = await Promise.all(allFilteredItems.map(async (item) => {
+        // V5 URI: Use media_source_uri for URL resolution when available
+        const mediaId = item.media_source_uri || item.path;
+        const resolvedUrl = await this._resolveMediaPath(mediaId);
+        return {
+          ...item,
+          media_content_id: mediaId, // CRITICAL: Add media_content_id for queue validation
+          url: resolvedUrl,
+          path: item.path, // Keep filesystem path for metadata
+          filename: item.filename || item.path.split('/').pop(),
+          folder: item.folder || item.path.substring(0, item.path.lastIndexOf('/')),
+          // EXIF metadata from backend
+          date_taken: item.date_taken,
+          created_time: item.created_time,
+          modified_time: item.modified_time,
+          location_city: item.location_city,
+          location_state: item.location_state,
+          location_country: item.location_country,
+          location_country_code: item.location_country_code,
+          location_name: item.location_name,
+          has_coordinates: item.latitude != null && item.longitude != null,
+          is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
+          latitude: item.latitude,
+          longitude: item.longitude,
+          is_favorited: item.is_favorited || false
+        };
+      }));
+      
+      this._log(`QUERY RESULT: Received ${items.length} ordered items`);
+      if (this.config?.debug_mode) {
+        items.slice(0, 3).forEach((item, idx) => {
+          this._log(`Item ${idx}: path="${item.path}", ${this.orderBy}=${item[this.orderBy]}`);
+        });
+      }
+      
+      // V5.6.8: Update class-level cursor so subsequent refills don't re-fetch same items
+      // This is critical for proper pagination when queue.length < 10 triggers immediate refill
+      this.lastSeenValue = localCursor;
+      this.lastSeenId = localCursorId;
+      
+      return items;
     } catch (error) {
       console.error('[SequentialMediaIndexProvider] ❌ Error querying media_index:', error);
       return null;
@@ -3661,9 +4682,49 @@ class SequentialMediaIndexProvider extends MediaProvider {
     return `media-source://media_source/media/${filePath}`;
   }
 
+  // Normalize a path for consistent comparison (handle URL encoding, special chars)
+  _normalizePath(path) {
+    if (!path) return '';
+    // Decode URL-encoded characters for consistent comparison
+    try {
+      path = decodeURIComponent(path);
+    } catch (e) {
+      // Log decode failures for debugging while preserving original behavior
+      this._log(`⚠️ Failed to decode path "${path}": ${e?.message || e}`);
+    }
+    // Strip media-source:// prefix if present
+    path = path.replace(/^media-source:\/\/media_source/, '');
+    return path;
+  }
+
   // Track excluded files
   excludeFile(path) {
+    if (!path) return;
+    // Store both original and normalized versions to catch all variations
+    const normalizedPath = this._normalizePath(path);
     this.excludedFiles.add(path);
+    this.excludedFiles.add(normalizedPath);
+    this._log(`🚫 Excluding file: ${path}`);
+    this._log(`🚫 Normalized path: ${normalizedPath}`);
+    this._log(`🚫 excludedFiles now has ${this.excludedFiles.size} entries`);
+  }
+
+  // Check if a file is excluded (individual 404 exclusions OR config path patterns)
+  _isExcluded(path) {
+    if (!path) return false;
+    const normalizedPath = this._normalizePath(path);
+    // Check explicitly excluded individual files (404s, etc.)
+    if (this.excludedFiles.has(path) || this.excludedFiles.has(normalizedPath)) return true;
+    // V5.7: Check excluded path patterns - read from card instance (not config)
+    const excludedPatterns = this.card?._excludedPathPatterns;
+    if (excludedPatterns && excludedPatterns.length > 0) {
+      const result = MediaProvider.matchesExcludedPath(path, excludedPatterns);
+      if (result.excluded) {
+        this._log(`🚫 Path pattern excluded: "${result.matchedPattern}" matches ${path}`);
+        return true;
+      }
+    }
+    return false;
   }
 
   // Reset to beginning of sequence (for loop functionality)
@@ -3671,6 +4732,7 @@ class SequentialMediaIndexProvider extends MediaProvider {
     this._log('Resetting to beginning of sequence');
     this.queue = [];
     this.lastSeenValue = null;
+    this.lastSeenId = null;  // V5.6.8: Also reset the secondary cursor
     this.hasMore = true;
     this.reachedEnd = false;
     return this.initialize();
@@ -3747,6 +4809,7 @@ class SequentialMediaIndexProvider extends MediaProvider {
     
     // Reset cursor to beginning
     this.lastSeenValue = null;
+    this.lastSeenId = null;  // V5.6.8: Also reset the secondary cursor
     this.hasMore = true;
     this.reachedEnd = false;
     
@@ -3777,12 +4840,127 @@ class SequentialMediaIndexProvider extends MediaProvider {
       newFirstItem
     };
   }
+  
+  /**
+   * V5.6.8: Check for new files since the start of the slideshow
+   * Called periodically by media-card to detect files added to the library.
+   * Returns array of new items that weren't in the original query.
+   * Does NOT reset cursor or change provider state.
+   */
+  async checkForNewFiles() {
+    if (!MediaProvider.isMediaIndexActive(this.config)) {
+      this._log('⚠️ Media index not configured - cannot check for new files');
+      return [];
+    }
+    
+    // Remember the first item we saw when slideshow started
+    // This is stored when queue is first populated
+    if (!this._firstItemAtStart) {
+      this._log('📝 No reference point - cannot check for new files');
+      return [];
+    }
+    
+    this._log('🔍 Checking for files newer than session start...');
+    
+    try {
+      // Query from the beginning (no cursor) to get current newest files
+      let folderFilter = null;
+      if (this.config.folder?.path) {
+        let path = this.config.folder.path;
+        if (!path.startsWith('media-source://immich')) {
+          folderFilter = path;
+        }
+      }
+      
+      const serviceData = {
+        count: this.queueSize, // Get same batch size as normal query
+        folder: folderFilter,
+        recursive: this.recursive,
+        file_type: this.config.media_type === 'all' ? undefined : this.config.media_type,
+        order_by: this.orderBy,
+        order_direction: this.orderDirection
+        // No cursor - query from beginning
+      };
+      
+      const wsCall = {
+        type: 'call_service',
+        domain: 'media_index',
+        service: 'get_ordered_files',
+        service_data: serviceData,
+        return_response: true
+      };
+      
+      if (this.config.media_index?.entity_id) {
+        wsCall.target = {
+          entity_id: this.config.media_index.entity_id
+        };
+      }
+      
+      const wsResponse = await this.hass.callWS(wsCall);
+      const response = wsResponse?.response || wsResponse?.service_response || wsResponse;
+      
+      if (!response || !response.items || !Array.isArray(response.items)) {
+        this._log('⚠️ No items in periodic check response');
+        return [];
+      }
+      
+      // Find items that are newer than our reference point
+      const newItems = [];
+      for (const item of response.items) {
+        // Stop when we hit the item we started with (or older)
+        if (item.media_content_id === this._firstItemAtStart || 
+            item.path === this._firstItemAtStart) {
+          break;
+        }
+        
+        // Also stop if date is older than reference (for safety)
+        if (this._firstItemDateAtStart) {
+          const itemDate = item.date_taken || item.modified_time || 0;
+          if (itemDate <= this._firstItemDateAtStart) {
+            break;
+          }
+        }
+        
+        // Transform item like _queryOrderedFiles does
+        const pathMetadata = MediaProvider.extractMetadataFromPath(item.path, this.config);
+        const mediaId = item.media_source_uri || item.path;
+        
+        newItems.push({
+          media_content_id: mediaId,
+          media_content_type: item.file_type === 'video' ? 'video' : 'image',
+          title: pathMetadata.filename,
+          path: item.path,
+          media_source_uri: item.media_source_uri,
+          filename: pathMetadata.filename,
+          metadata: {
+            ...pathMetadata,
+            path: item.path,
+            media_source_uri: item.media_source_uri,
+            date_taken: item.date_taken,
+            created_time: item.created_time,
+            location_city: item.location_city,
+            location_state: item.location_state,
+            location_country: item.location_country,
+            location_country_code: item.location_country_code,
+            location_name: item.location_name,
+            has_coordinates: item.latitude != null && item.longitude != null,
+            is_geocoded: !!(item.is_geocoded || item.location_city || item.location_state || item.location_country),
+            latitude: item.latitude,
+            longitude: item.longitude,
+            is_favorited: item.is_favorited || false
+          }
+        });
+      }
+      
+      this._log(`🔍 Periodic check found ${newItems.length} new files`);
+      return newItems;
+      
+    } catch (error) {
+      console.error('[SequentialMediaIndexProvider] ❌ Error in checkForNewFiles:', error);
+      return [];
+    }
+  }
 }
-
-// Note: SubfolderQueue is defined in src/providers/subfolder-queue.js
-// Any hierarchical random folder logic should be imported from that module.
-
-
 
 /**
  * MediaCard - Main card component
@@ -3793,7 +4971,7 @@ class MediaCard extends LitElement {
   static CARD_HEIGHT_MIN = 100;
   static CARD_HEIGHT_MAX = 5000;
   static CARD_HEIGHT_STEP = 50;
-  
+
   // Friendly state names for HA binary sensor device classes (v5.6)
   static FRIENDLY_STATES = {
     'battery': { 'on': 'Low', 'off': 'Normal' },
@@ -3859,7 +5037,7 @@ class MediaCard extends LitElement {
   }
 
   static getConfigElement() {
-    return document.createElement('media-card-editor');
+    return document.createElement('media-viewer-card-editor');
   }
 
   static getStubConfig() {
@@ -3871,10 +5049,47 @@ class MediaCard extends LitElement {
         recursive: true
       },
       media_type: 'all',
-      auto_advance_duration: 5,
+      auto_advance_seconds: 5,
       show_metadata: true,
       enable_navigation_zones: true,
       title: 'Media Slideshow'
+    };
+  }
+
+  _applyICloudPhotosPreset(config) {
+    if (config?.icloud_photos?.enabled !== true) {
+      return config;
+    }
+
+    const icloudConfig = config.icloud_photos || {};
+    const basePath = icloudConfig.media_source_path || 'media-source://media_source/local/icloud_photos';
+    const album = icloudConfig.album || icloudConfig.photo_album || '';
+    const normalizedBasePath = basePath.replace(/\/$/, '');
+    const folderPath = album
+      ? `${normalizedBasePath}/${album}`
+      : normalizedBasePath;
+
+    return {
+      ...config,
+      media_source_type: 'folder',
+      media_type: config.media_type || 'all',
+      folder: {
+        mode: 'random',
+        recursive: true,
+        ...config.folder,
+        path: config.folder?.path || folderPath
+      },
+      live_photo: {
+        enabled: true,
+        still_duration: 1,
+        repeat_delay: 10,
+        pause_duration: 10,
+        video_suffixes: ['_HEVC', '-HEVC', ''],
+        video_extensions: ['MOV', 'mov', 'mp4', 'MP4', 'm4v', 'M4V'],
+        still_extensions: ['JPG', 'jpg', 'JPEG', 'jpeg', 'PNG', 'png', 'WEBP', 'webp'],
+        hide_companion_videos: true,
+        ...config.live_photo
+      }
     };
   }
 
@@ -3901,10 +5116,26 @@ class MediaCard extends LitElement {
     this.isLoading = false;
     this._cardId = 'card-' + Math.random().toString(36).substr(2, 9);
     this._retryAttempts = new Map(); // Track retry attempts per URL (V4)
+    this._videoTransientFailures = new Map(); // V5.8: Track per-item video failure count (handles transient 400s from Reolink etc.)
+    this._locationRetryCount = new Map(); // Track location metadata retry attempts per media path (for videos missing GPS)
+    this._locationRetryTimers = new Map(); // setTimeout handles for pending location metadata retries, keyed by media path
     this._errorState = null; // V4 error state tracking
+    this._noResultsReason = null; // 'filtered' | 'empty_collection' — set when init found zero items but it's not a hard failure
+    this._configMismatchDetected = false; // true when this card's blocking config differs from the active shared queue
+    this._configMismatchDiff = null;      // [{key, label, mine, theirs}] for display in error banner
+    this._localConfigFields = null;       // extracted blocking fields from current base config
+    this._initGeneration = 0;             // incremented on each _initializeProvider call; stale inits check this and bail
+    this._pendingFilterChangeRestore = null; // stashed {queue, currentIndex, metadata} to adopt after filter-change reinit
+    this._pendingProviderStateRestore = null; // stashed navigation/display state to preserve the current queue across provider-only override changes
+    this._reconnectSyncApplied = false;       // set by _syncFromSharedQueueOnReconnect to block _tryRestoreFromSharedQueue from clobbering fresher state
+    this._suppressLookaheadFill = false;         // set after any shared-queue restore; cleared on first _loadNext() to prevent each card independently pre-filling with different random items
+    this._videoEndFollowerTimer = null;          // safety timer set when a cross-device follower defers its video-end advance to the leader
     this._currentMetadata = null; // V4 metadata tracking for action buttons/display
     this._currentMediaPath = null; // V4 current file path for action buttons
-    this._tapTimeout = null; // V4 tap action double-tap detection
+    this._tapTimeout = null;         // V4 tap action double-tap detection
+    this._navClickTimerLeft = null;  // debounce: prevent nav-zone click from firing during dblclick seek
+    this._navClickTimerRight = null; // same for right zone
+    this._suppressCastPushOnCanplay = false; // true when _startCastSync or _seekVideo already pushed; skip canplay re-push
     this._frontLayerUrl = ''; // V5.6: Front layer for crossfade
     this._backLayerUrl = ''; // V5.6: Back layer for crossfade
     this._frontLayerActive = true; // V5.6: Which layer is currently visible
@@ -3931,7 +5162,31 @@ class MediaCard extends LitElement {
     this._editorPreview = false; // V5.5: Flag to indicate card is in config editor preview
     this._cachedHeaderElement = null; // V5.6: Cached HA header element for viewport height calculation
     this._cachedHeaderSelector = null; // V5.6: Selector that found the cached header
-    
+
+    // Cast-to-TV state
+    this._castEntityId = null;     // media_player entity currently mirroring this card
+    this._castPauseTimer = null;   // setTimeout handle for pre-end pause
+    this._castSyncPoller = null;   // setInterval handle for Roku startup sync polling
+    this._castDriftPoller = null;  // setInterval handle for ongoing drift correction
+    this._castSyncTimeout = null;  // setTimeout handle for 10s sync safety fallback
+    this._castSyncPausing = false;   // guard: suppress _onVideoPause during cast-sync pause
+    this._castPreEndPauseSent = false; // guard: true after pre-end pause sent to Roku (prevents double-send)
+    this._castSeekSuppressUntil = 0;  // timestamp: suppress drift correction until this time after a seek
+    this._castEndWatcher = null;         // setInterval handle: polls Roku ECP after local video ends (auto-advance with cast)
+    this._castPrevEntityState = null;    // last known media_player state for remote pause/resume detection
+    this._castRemotePaused = false;      // true when the slideshow was paused by the cast remote (not the card)
+    this._pendingSyncCastSeekPosition = null;     // one-shot video position (seconds) to include in next sync broadcast
+    this._pendingXDeviceCastSeekPosition = null;  // preserved seek pos for the debounced cross-device write
+    this._pendingXDeviceIsPaused = undefined;     // forced is_paused override for the debounced cross-device write
+    this._castSyncGroupPaused = false;            // true while waiting for Roku to start; followers paused via group-pause
+
+    // Session override (runtime filter/playback picker)
+    this._sessionOverride = null; // null = no override; object = active override choices
+    this._baseConfig = null;      // saved this.config before first override applied
+    this._suppressFilterBroadcast = false; // guard: skip broadcast when applying filter received from sync
+    this._preFilterCursor = null;          // SequentialMediaIndexProvider cursor saved when filter is applied
+    this._pendingProviderCursor = null;    // cursor to inject into new provider when filter is cleared
+
     // V5.5: Side Panel System (Burst Review & Queue Preview)
     // Panel state
     this._panelMode = null;            // null | 'burst' | 'queue' | 'history'
@@ -3958,6 +5213,19 @@ class MediaCard extends LitElement {
     // V5.5: On This Day state (anniversary mode)
     this._onThisDayLoading = false;    // Loading indicator for anniversary query
     this._onThisDayWindowDays = 0;     // Current window size (±N days)
+    this._onThisDayUsePhotoDate = false; // V5.6.7: Use photo's date vs today's date
+    
+    // V5.6.7: Queue panel scroll position preservation
+    this._previousQueuePageIndex = null;   // Saved queue scroll position before special panels
+    this._previousPauseState = null;       // Saved pause state before special panels
+    this._previousNavigationIndex = null;  // Saved navigation index before navigation
+    this._isLoadingNext = false;  // Re-entrance guard for _loadNext()
+    this._isManualNavigation = false; // V5.6.7: Track if navigation is user-initiated vs timer-driven
+    this._manualNavLoading = false;    // True from navigation commit until _onMediaLoaded/_onVideoCanPlay fires
+    this._swipeTouchStartX = null;    // Touch start X for swipe gesture detection
+    this._swipeTouchStartY = null;    // Touch start Y for swipe gesture detection
+    this._navigationGeneration = 0;    // Increments whenever newer navigation should obsolete async work
+    this._activeMediaPrepare = null;   // Current off-DOM image/video preparation task
     
     // V5.6.0: Play randomized option for panels
     this._playRandomized = false;      // Toggle for randomizing panel playback order
@@ -3972,22 +5240,75 @@ class MediaCard extends LitElement {
     this._last404Time = 0;
     this._errorAutoAdvanceTimeout = null;
     
-    // V5.6: Video thumbnail cache (session-scoped)
+    // V5.6.7: Hide bottom overlays during video playback (to access video controls)
+    this._hideBottomOverlaysForVideo = false;
+    
+    // V5.6.8: Video controls visibility (for controls-on-tap feature)
+    this._videoControlsVisible = false;
+    
+    // V5.6.9: Safari detection - Safari needs conditional controls attribute, Chrome uses CSS
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+    this._isSafari = /Safari/.test(ua) && !/Chrome/.test(ua) && !/Chromium/.test(ua);
+    
+    // V5.6: Video thumbnail cache (session-scoped, capped at 300 entries)
     this._videoThumbnailCache = new Map();
     this._thumbnailObserver = null;
+
+    // Persistent resolved-URL cache: survives queue refills so _renderThumbnailStrip
+    // doesn't re-fire callWS for items it has already resolved this session.
+    // Keyed by media_content_id / media_source_uri / path. Capped at 2000 entries.
+    this._thumbnailUrlCache = new Map();
     
-    // V5.7: Track which navigation index each crossfade layer belongs to
+    // V5.6.7: Track panel content to prevent unnecessary thumbnail re-renders
+    this._lastPanelItemsHash = null;
+    this._cachedThumbnailStripTemplate = null;
+    
+    // V5.6.8: Periodic refresh counter - tracks items since last provider refresh
+    // Triggers a check for new files every slideshow_window items
+    this._itemsSinceRefresh = 0;
+
+    // Lookahead queue fill count (set in setConfig from queue_lookahead config key)
+    this._lookaheadCount = 10;
+
+    // Thumbnail long-press menu state
+    this._thumbnailHoldTimer = null;
+    this._thumbnailHoldFired = false;
+    this._thumbnailMenuIndex = null;   // actualIndex of open mini-menu; null = none
+
+    // V5.6.7: Track which navigation index each crossfade layer belongs to
     this._frontLayerNavigationIndex = null;  // Navigation index for front layer image
     this._backLayerNavigationIndex = null;   // Navigation index for back layer image
     this._frontLayerGeneration = 0;   // Increment when front layer URL changes (prevents stale setTimeout clearing new URLs)
     this._backLayerGeneration = 0;    // Increment when back layer URL changes (prevents stale setTimeout clearing new URLs)
     
+    // Refresh button hold state (tap = image refresh, hold = queue refresh in folder mode)
+    this._refreshHoldTimer = null;
+    this._refreshHoldFired = false;
+
     // Auto-hide action buttons for touch screens
     this._showButtonsExplicitly = false; // true = show via touch tap (independent of hover)
     this._hideButtonsTimer = null;
     this._actionButtonsBaseTimeout = 3000;  // 3s minimum for touchscreen
     this._actionButtonsMaxTimeout = 15000;  // 15s maximum for touchscreen
     
+    // V5.6.12: User mute preference state
+    this._userMutePreference = null;      // null=no preference, true=muted, false=unmuted
+    this._mutePreferenceTimestamp = 0;    // When user last changed preference
+    this._suppressVolumeChangeHandler = false; // V5.8: True during programmatic mute toggles (suppresses native-control detection)
+    
+    // Live Photo playback state. Used for iCloud-style still + companion video pairs.
+    this._livePhotoPhase = 'idle';        // idle | still | video | pause
+    this._livePhotoVideoUrl = '';
+    this._livePhotoVideoReady = false;
+    this._livePhotoTimer = null;
+    this._livePhotoCompanionCache = new Map();
+    this._livePhotoCompanionVideoCache = new Map();
+    this._livePhotoNegativeCacheMs = 5 * 60 * 1000;
+    this._livePhotoGeneration = 0;
+
+    this._heicObjectUrlCache = new Map();
+    this._heicConverterPromise = null;
+
     this._log('💎 Constructor called, cardId:', this._cardId);
   }
 
@@ -4018,22 +5339,71 @@ class MediaCard extends LitElement {
       this._startClockTimer();
     }
     
+    // Shared queue: register event listeners and claim leadership BEFORE the reconnect
+    // auto-refresh below, so _setupAutoRefresh() correctly sees this card as leader.
+    this._subscribeToSyncEvents();
+
+    // Leader election: try to become the timer leader for this sync group.
+    // If the slot is empty this card claims it; otherwise it defers to the current leader.
+    this._tryClaimLeadership();
+
+    // Listen for the vacancy event fired when the leader disconnects, so a follower
+    // can step up and start its own timer. Only registered when shared_queue_id is set.
+    if (this.config?.shared_queue_id) {
+      this._leaderVacatedHandler = (e) => {
+        if (e.detail?.sharedQueueId !== this.config?.shared_queue_id) return;
+        const claimed = this._tryClaimLeadership();
+        if (claimed) {
+          this._log('👑 Stepping up as leader after vacancy — starting timer');
+          this._setupAutoRefresh();
+        }
+      };
+      window.addEventListener('ha-media-card-leader-vacated', this._leaderVacatedHandler);
+    }
+
     // V5: Restart auto-refresh if it was running before disconnect
     // Only restart if we have a provider, currentMedia, and auto_advance is configured
     if (this.provider && this.currentMedia && this.config.auto_advance_seconds > 0) {
       this._log('🔄 Reconnected - restarting auto-refresh timer');
       this._setupAutoRefresh();
     }
+
+    // Shared queue: if reconnecting (provider already exists), sync state from
+    // media-index or localStorage to pick up where the other card left off
+    if (this.provider && this.config?.shared_queue_id) {
+      this._syncFromSharedQueueOnReconnect();
+    }
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
-    
+
+    // Stop any active cast so the TV doesn't show a frozen image after the
+    // card is removed or the user navigates away.
+    if (this._castEntityId) this._stopCast();
+
     this._log('🔌 Component disconnected - cleaning up resources');
-    
+
+    // Cancel any pending follower video-end safety timer
+    if (this._videoEndFollowerTimer) {
+      clearTimeout(this._videoEndFollowerTimer);
+      this._videoEndFollowerTimer = null;
+    }
+
     // NEW: Cleanup kiosk mode monitoring
     this._cleanupKioskModeMonitoring();
     
+    // Shared queue: remove all event listeners and cancel pending debounced write
+    this._unsubscribeFromSyncEvents();
+
+    // Leader election: remove the vacancy listener and release leadership.
+    // _relinquishLeadership fires ha-media-card-leader-vacated so a follower steps up.
+    if (this._leaderVacatedHandler) {
+      window.removeEventListener('ha-media-card-leader-vacated', this._leaderVacatedHandler);
+      this._leaderVacatedHandler = null;
+    }
+    this._relinquishLeadership();
+
     // V5.6: Cleanup viewport height observer
     this._cleanupDynamicViewportHeight();
     
@@ -4095,6 +5465,18 @@ class MediaCard extends LitElement {
     
     // V5.6: Cleanup clock timer
     this._stopClockTimer();
+    
+    // Cleanup Live Photo playback timers
+    this._clearLivePhotoPlayback();
+    this._cancelActiveMediaPrepare('card disconnect');
+    this._revokeHeicObjectUrls();
+
+    // Clean up passive touchstart listener added in updated()
+    if (this._passiveContainerTouchBound) {
+      this.shadowRoot?.querySelector('.media-container')
+        ?.removeEventListener('touchstart', this._passiveContainerTouchBound);
+      this._passiveContainerTouchBound = null;
+    }
   }
 
   // V4: Force video reload when URL changes
@@ -4109,17 +5491,20 @@ class MediaCard extends LitElement {
       this._log('🖼️ Hass available - setting up kiosk mode monitoring');
       this._setupKioskModeMonitoring();
     }
-    
+
     if (changedProperties.has('mediaUrl')) {
       // Wait for next frame to ensure video element is rendered
       requestAnimationFrame(() => {
-        const videoElement = this.shadowRoot?.querySelector('video');
+        const videoElement = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
         
         if (videoElement && this.mediaUrl) {
           videoElement.load(); // Force browser to reload the video with new source
           
-          // Auto-play if configured
-          if (this.config.video_autoplay) {
+          // Auto-play if configured and not group-paused.
+          // Skip play() when group-paused: a combined navigation+group-pause sync
+          // (from cast manual navigation) sets _groupPaused before the video loads;
+          // starting playback here would immediately override the paused state.
+          if (this.config.video_autoplay && !this._groupPaused) {
             videoElement.play().catch(err => {
               // AbortError happens when video is removed from DOM before play() completes (rapid navigation)
               // This is normal during fast navigation and can be safely ignored
@@ -4302,11 +5687,13 @@ class MediaCard extends LitElement {
   // V4: Debug logging with throttling
   _log(...args) {
     if (this._debugMode || window.location.hostname === 'localhost') {
-      // Prefix all logs with card ID and path for debugging
-      const path = this.config?.single_media?.path?.split('/').pop() || 
-                   this.config?.media_path?.split('/').pop() || 'no-path';
-      const prefix = `[${this._cardId}:${path}]`;
-      const message = args.join(' ');
+      // Prefix all logs with card ID for debugging
+      const prefix = `[${this._cardId}]`;
+      // Strip auth tokens (e.g. Synology authSig) so logs stay readable when pasting
+      const sanitizedArgs = args.map(a =>
+        typeof a === 'string' ? a.replace(/([?&])authSig=[^&\s]*/gi, '$1authSig=[…]') : a
+      );
+      const message = sanitizedArgs.join(' ');
       
       // Throttle certain frequent messages to avoid spam
       const throttlePatterns = [
@@ -4331,7 +5718,7 @@ class MediaCard extends LitElement {
         this._lastLogTime[message] = now;
       }
       
-      console.log(prefix, ...args);
+      console.log(prefix, ...sanitizedArgs);
     }
   }
 
@@ -4459,13 +5846,19 @@ class MediaCard extends LitElement {
       throw new Error('Invalid configuration');
     }
     this._log('📝 setConfig called with:', config);
-    
+
+    // Clear any active session override — new YAML config takes precedence
+    this._sessionOverride = null;
+    this._baseConfig = null;
+
     // MIGRATION: Detect V4 config and convert to V5a format
     if (!config.media_source_type && config.media_path) {
       this._log('🔄 Detected V4 config - migrating to V5a format');
       config = this._migrateV4ConfigToV5a(config);
       this._log('✅ V4 config migrated:', config);
     }
+
+    config = this._applyICloudPhotosPreset(config);
     
     // V5: Clear auto-advance timer when reconfiguring (prevents duplicate timers)
     if (this._refreshInterval) {
@@ -4473,6 +5866,9 @@ class MediaCard extends LitElement {
       clearInterval(this._refreshInterval);
       this._refreshInterval = null;
     }
+    this._clearLivePhotoPlayback();
+    this._livePhotoCompanionCache?.clear();
+    this._livePhotoCompanionVideoCache?.clear();
     
     // V5: Validate and clamp max_height_pixels if present
     if (config.max_height_pixels !== undefined) {
@@ -4546,6 +5942,7 @@ class MediaCard extends LitElement {
         show_time: false,
         show_location: true,
         show_rating: false,
+        show_burst_info: false,
         show_root_folder: true,
         position: 'bottom-left',
         ...config.metadata
@@ -4561,6 +5958,32 @@ class MediaCard extends LitElement {
         recent_change_window: 60, // seconds
         ...config.display_entities
       },
+      // V5.11: Live Photo pairing/playback for still + companion video exports
+      live_photo: {
+        enabled: false,
+        still_duration: 1,
+        repeat_delay: 10,
+        pause_duration: 10,
+        video_suffixes: ['_HEVC', '-HEVC', ''],
+        video_extensions: ['MOV', 'mov', 'mp4', 'MP4', 'm4v', 'M4V'],
+        still_extensions: ['JPG', 'jpg', 'JPEG', 'jpeg', 'PNG', 'png', 'WEBP', 'webp'],
+        hide_companion_videos: true,
+        ...config.live_photo
+      },
+      heic: {
+        enabled: true,
+        library_url: 'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js',
+        output_type: 'image/jpeg',
+        quality: 0.92,
+        ...config.heic
+      },
+      preload: {
+        enabled: true,
+        image_decode: true,
+        video_mode: 'metadata',
+        video_timeout_ms: 3000,
+        ...config.preload
+      },
       // V5.6: Clock/Date Overlay defaults
       clock: {
         enabled: false,
@@ -4574,10 +5997,20 @@ class MediaCard extends LitElement {
       },
       // V5.6: Global overlay opacity control
       overlay_opacity: config.overlay_opacity ?? 0.25,
-      // V5.7: Card background blending - default true for seamless look
+      // V5.6.7: Card background blending - default true for seamless look
       blend_with_background: config.blend_with_background !== false,
-      // V5.7: Edge fade strength (0 = disabled, 1-100 = enabled with fade intensity)
-      edge_fade_strength: config.edge_fade_strength ?? 0
+      // V5.6.12: Mute preference timeout (seconds) - how long user's mute choice persists
+      mute_preference_timeout: config.mute_preference_timeout ?? 300,
+      // V5.6.7: Edge fade strength (0 = disabled, 1-100 = enabled with fade intensity)
+      edge_fade_strength: config.edge_fade_strength ?? 0,
+      // V5.11: iCloud Photos preset. Sync is handled server-side; the card owns display defaults.
+      icloud_photos: {
+        enabled: false,
+        media_source_path: 'media-source://media_source/local/icloud_photos',
+        album: '',
+        sync_backend: 'icloudpd',
+        ...config.icloud_photos
+      }
     };
     
     // V4: Set debug mode from config
@@ -4614,18 +6047,25 @@ class MediaCard extends LitElement {
       }
     }
     
+    // card_height_fill: when card_height is set, fill container with cover cropping
+    if (config.card_height && config.card_height > 0 && config.card_height_fill) {
+      this.setAttribute('data-card-height-fill', 'true');
+    } else {
+      this.removeAttribute('data-card-height-fill');
+    }
+
     // V5: Set media source type attribute for CSS targeting
     const mediaSourceType = this.config.media_source_type || 'single_media';
     this.setAttribute('data-media-source-type', mediaSourceType);
     
-    // V5.7: Set blend with background attribute for CSS targeting
+    // V5.6.7: Set blend with background attribute for CSS targeting
     if (this.config.blend_with_background !== false) {
       this.setAttribute('data-blend-with-background', 'true');
     } else {
       this.removeAttribute('data-blend-with-background');
     }
     
-    // V5.7: Set edge fade attribute and strength for CSS targeting
+    // V5.6.7: Set edge fade attribute and strength for CSS targeting
     if (this.config.edge_fade_strength > 0) {
       this.setAttribute('data-edge-fade', 'true');
       this.style.setProperty('--edge-fade-strength', this.config.edge_fade_strength);
@@ -4638,16 +6078,91 @@ class MediaCard extends LitElement {
     const positionIndicatorPosition = this.config.position_indicator?.position || 'bottom-right';
     this.setAttribute('data-position-indicator-position', positionIndicatorPosition);
     
-    // V5.3: Set max navigation queue size based on slideshow_window
-    const slideshowWindow = this.config.slideshow_window || 100;
-    this.maxNavQueueSize = slideshowWindow * 2;
-    this._log('Set maxNavQueueSize to', this.maxNavQueueSize, '(slideshow_window * 2)');
+    // V5.6.8: Navigation queue size is now independent of slideshow_window
+    // slideshow_window controls how frequently to check for new files (periodic refresh)
+    // navigation_queue_size controls how many items to keep in back-navigation history
+    // Default: max(slideshow_window, 100) - floor of 100, but at least holds one full batch
+    const slideshowWindow = this.config.slideshow_window ?? 100;
+    const defaultQueueSize = Math.max(slideshowWindow, 100);
+    this.maxNavQueueSize = this.config.navigation_queue_size || defaultQueueSize;
+    this._periodicRefreshInterval = slideshowWindow; // How often to check for new files
+    this._log('Set maxNavQueueSize to', this.maxNavQueueSize, 'periodicRefreshInterval:', this._periodicRefreshInterval);
+    this._lookaheadCount = Math.min(100, Math.max(1, this.config.queue_lookahead ?? 10));
+    
+    // V5.7: Compile excluded_paths patterns for path filtering
+    // Patterns are compiled to regex once and stored on the card instance.
+    // Providers access them via card._excludedPathPatterns (not via config, which must
+    // remain plain data safe for YAML serialization by the card editor).
+    this._excludedPathPatterns = MediaProvider.compileExcludedPathPatterns(config.excluded_paths);
+    
+    if (this._excludedPathPatterns.length > 0) {
+      this._log('📁 Path exclusions configured:');
+      for (const compiled of this._excludedPathPatterns) {
+        const description = MediaProvider.describeExclusionPattern(compiled.pattern, compiled.isRecursive);
+        this._log(`   • ${compiled.pattern} (${description})`);
+      }
+    }
     
     // V5: Trigger reinitialization if we already have hass
     if (this._hass) {
       this._log('📝 setConfig: Triggering provider reinitialization with existing hass');
       this._initializeProvider();
     }
+  }
+
+  /**
+   * V5.6.7: Update thumbnail active state without full re-render
+   * Called after every render cycle by Lit
+   */
+  updated(changedProps) {
+    super.updated(changedProps);
+
+    // Attach passive touchstart listeners to avoid scroll-blocking browser violations.
+    // Lit's @touchstart template binding cannot be made passive, so we use imperative
+    // addEventListener here (once per card lifetime). We use event delegation on the
+    // stable .media-container element so the single listener covers both the swipe
+    // gesture and the video-specific button-reveal behaviour.
+    if (!this._passiveContainerTouchBound) {
+      const container = this.shadowRoot?.querySelector('.media-container');
+      if (container) {
+        this._passiveContainerTouchBound = (e) => {
+          // Swipe detection always applies (records start coords; no preventDefault)
+          this._handleSwipeTouchStart(e);
+          // Button reveal when the touch target is (or is inside) the video element
+          if (e.composedPath().some(el => el.tagName === 'VIDEO')) {
+            this._showButtonsExplicitly = true;
+            this._startActionButtonsHideTimer();
+            this.requestUpdate();
+          }
+        };
+        container.addEventListener('touchstart', this._passiveContainerTouchBound, {passive: true});
+      }
+    }
+
+    // Update thumbnail active state whenever render completes
+    if (this._panelOpen) {
+      this._updateThumbnailActiveState();
+    }
+  }
+
+  /**
+   * V5.6.7: Update which thumbnail has 'active' class without re-rendering videos
+   */
+  _updateThumbnailActiveState() {
+    const thumbnailStrip = this.shadowRoot?.querySelector('.thumbnail-strip');
+    if (!thumbnailStrip) return;
+    
+    const thumbnails = thumbnailStrip.querySelectorAll('.thumbnail[data-item-index]');
+    const activeIndex = this._panelMode === 'queue' ? this.navigationIndex : this._panelQueueIndex;
+    
+    thumbnails.forEach(thumb => {
+      const itemIndex = parseInt(thumb.dataset.itemIndex);
+      if (itemIndex === activeIndex) {
+        thumb.classList.add('active');
+      } else {
+        thumb.classList.remove('active');
+      }
+    });
   }
 
   set hass(hass) {
@@ -4678,7 +6193,10 @@ class MediaCard extends LitElement {
     
     // V5.4: Monitor media_index entity state for auto-recovery after HA restart
     // If card is in error state and media_index entity exists and is available, retry init
-    if (hass && this._errorState && this.config?.media_index?.entity_id) {
+    // Only recover from init-level failures (string _errorState). Object _errorState means a
+    // media-file error (from _showMediaError) — re-initializing on those would loop forever
+    // when the restored queue brings back the same corrupt/unsupported file.
+    if (hass && typeof this._errorState === 'string' && this.config?.media_index?.entity_id) {
       const entityId = this.config.media_index.entity_id;
       const entityState = hass.states[entityId];
       
@@ -4691,6 +6209,55 @@ class MediaCard extends LitElement {
       }
     }
     
+    // Cast remote pause/resume detection: monitor the media_player entity state so
+    // that pausing or resuming via the physical remote propagates as a group pause/resume
+    // to all synced cards. This MUST live in the hass setter — not in updated() — because
+    // the custom get/set hass() pair overrides LitElement's reactive accessor, which means
+    // changedProperties.has('hass') never fires in updated() for this card.
+    if (this._castEntityId && hass) {
+      const castEntityState = hass.states[this._castEntityId]?.state;
+      const castEntityPrev  = this._castPrevEntityState;
+      this._castPrevEntityState = castEntityState;
+      if (castEntityPrev && castEntityState && castEntityState !== castEntityPrev) {
+        if (castEntityState === 'paused' && !this._castPreEndPauseSent && !this._castSyncPausing && !this._isPaused &&
+            (!this._castNavigationPauseAt || Date.now() - this._castNavigationPauseAt > 5000)) {
+          // User paused via the TV/Roku remote — group-pause all synced cards.
+          const mediaPos = hass.states[this._castEntityId]?.attributes?.media_position;
+          const seekPos  = typeof mediaPos === 'number' ? mediaPos : null;
+          this._castRemotePaused = true;
+          this._groupPaused = true;
+          this._setPauseState(true);
+          this._pauseTimer();
+          const castLocalVideo = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+          if (castLocalVideo && !castLocalVideo.paused) {
+            this._castSyncPausing = true;
+            castLocalVideo.pause();
+          }
+          if (seekPos !== null && castLocalVideo && !castLocalVideo.ended) {
+            castLocalVideo.currentTime = seekPos;
+          }
+          this._pendingSyncCastSeekPosition = seekPos;
+          this._claimDriverRole();
+          this._writeSharedQueueState(true);
+          this._log('\u23f8\ufe0f Cast entity paused by remote \u2014 group pausing at ' + (seekPos !== null ? seekPos.toFixed(1) : '?') + 's');
+        } else if (castEntityState === 'playing' && this._castRemotePaused && this._isPaused) {
+          // User resumed via the TV/Roku remote — group-resume all synced cards.
+          this._castRemotePaused = false;
+          this._groupPaused = false;
+          this._setPauseState(false);
+          this._resumeTimer();
+          const castLocalVideo = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+          if (castLocalVideo && castLocalVideo.paused && !castLocalVideo.ended) {
+            this._suppressCastPushOnCanplay = true;
+            castLocalVideo.play().catch(() => {});
+          }
+          this._claimDriverRole();
+          this._writeSharedQueueState(true);
+          this._log('\u25b6\ufe0f Cast entity resumed by remote \u2014 group resuming slideshow');
+        }
+      }
+    }
+
     // Note: Don't call requestUpdate() here - Lit will handle it automatically
     // since hass is a reactive property. We can't prevent the auto-update,
     // but we can make render() cheap when paused.
@@ -4704,6 +6271,32 @@ class MediaCard extends LitElement {
     if (!this.config || !this.hass) {
       this._log('Cannot initialize - missing config or hass');
       return;
+    }
+
+    // Increment the generation counter. Every await point below checks this value.
+    // If a newer _initializeProvider call has started (e.g. from _applySessionOverride
+    // being triggered mid-init by _tryRestoreFromSharedQueue), the stale init silently
+    // aborts instead of racing the newer one to set shared state.
+    const generation = ++this._initGeneration;
+
+    // Reset error/no-results state (fresh check on each init) so a prior failure or empty
+    // result doesn't linger on screen while this new attempt (e.g. after a filter change) runs.
+    this._errorState = null;
+    this._noResultsReason = null;
+
+    // Reset config-mismatch state (fresh check on each init) and capture this card's
+    // blocking fields so write paths and mismatch checks are based on the current config.
+    this._configMismatchDetected = false;
+    this._configMismatchDiff = null;
+    this._localConfigFields = this._extractBlockingConfigFields(this._baseConfig || this.config);
+    // Discard any stale pending filter-change restore from a prior reinit so it doesn't
+    // leak into this fresh initialization if the reinit wasn't filter-change-driven.
+    // IMPORTANT: when _skipSharedQueueRestore = true, this reinit WAS triggered by a
+    // filter change (local apply/clear or incoming sync override). In that case, preserve
+    // the stash so _tryRestoreFromSharedQueue can adopt the driver's exact position
+    // immediately instead of going to follower-wait mode.
+    if (!this._skipSharedQueueRestore) {
+      this._pendingFilterChangeRestore = null;
     }
 
     // Reset max queue size when initializing new provider
@@ -4781,7 +6374,7 @@ class MediaCard extends LitElement {
           break;
         
         default:
-          console.warn('[MediaCard] Unknown media source type:', type, '- defaulting to single_media');
+          console.warn('[MediaViewerCard] Unknown media source type:', type, '- defaulting to single_media');
           this.provider = new SingleMediaProvider(this.config, this.hass);
       }
 
@@ -4789,27 +6382,87 @@ class MediaCard extends LitElement {
       this.isLoading = true;
       this._log('Calling provider.initialize()');
       const success = await this.provider.initialize();
+      if (this._initGeneration !== generation) return; // stale — a newer init has taken over
       this._log('Provider initialized:', success);
       
       if (success) {
-        // V5 FIX: If we reconnected with history, restore current media from history
-        if (this.history.length > 0 && this.historyPosition >= 0) {
+        if (this._pendingProviderStateRestore) {
+          const restore = this._pendingProviderStateRestore;
+          this._pendingProviderStateRestore = null;
+          this.navigationQueue = Array.isArray(restore.navigationQueue) ? [...restore.navigationQueue] : [];
+          this.navigationIndex = typeof restore.navigationIndex === 'number' ? restore.navigationIndex : -1;
+          this.isNavigationQueuePreloaded = restore.isNavigationQueuePreloaded === true;
+          this._maxQueueSize = restore.maxQueueSize || 0;
+          this.history = Array.isArray(restore.history) ? [...restore.history] : [];
+          this.historyPosition = typeof restore.historyPosition === 'number' ? restore.historyPosition : -1;
+          this.currentMedia = restore.currentMedia || null;
+          this._currentMediaPath = restore.currentMediaPath || null;
+          this._currentMetadata = restore.currentMetadata || null;
+          this._pendingMetadata = restore.pendingMetadata || null;
+          this.mediaUrl = restore.mediaUrl || '';
+          this._frontLayerUrl = restore.frontLayerUrl || '';
+          this._backLayerUrl = restore.backLayerUrl || '';
+          this._frontLayerActive = restore.frontLayerActive !== false;
+          this.isLoading = false;
+          this.requestUpdate();
+          if (!this._isPaused) {
+            this._setupAutoRefresh();
+          }
+          return;
+        }
+
+        // Shared queue takes priority over local history when configured — it holds the
+        // freshest cross-card state (what the other card was showing when this view was hidden).
+        const restoredFromShared = await this._tryRestoreFromSharedQueue();
+        if (this._initGeneration !== generation) return; // stale — _tryRestoreFromSharedQueue triggered a reinit
+
+        // Config mismatch detected during restore — the stored queue belongs to a card
+        // with different settings. Block this card and show the error banner.
+        if (this._configMismatchDetected) {
+          this.isLoading = false;
+          this.requestUpdate();
+          return;
+        }
+
+        if (restoredFromShared) {
+          // Queue and index already set — jump directly to the saved item
+          const item = this.navigationQueue[this.navigationIndex];
+          if (item) {
+            this._clearLivePhotoPlayback();
+            this.currentMedia = item;
+            this._pendingNavigationIndex = this.navigationIndex;
+            this._pendingMediaPath = item.media_content_id;
+            this._pendingMetadata = item.metadata || null;
+            await this._resolveMediaUrl();
+            if (this._initGeneration !== generation) return;
+            // Fetch fresh metadata from media_index in background (item.metadata from
+            // shared queue restore may be null or stale if the sync state was old)
+            this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+          } else {
+            await this._loadNext();
+            if (this._initGeneration !== generation) return;
+          }
+        } else if (this.history.length > 0 && this.historyPosition >= 0) {
+          // V5 FIX: If we reconnected with history, restore current media from history
           this._log('🔄 Reconnected with history - loading media at position', this.historyPosition);
           const historyItem = this.history[this.historyPosition];
           if (historyItem) {
+            this._clearLivePhotoPlayback();
             this.currentMedia = historyItem;
             await this._resolveMediaUrl();
+            if (this._initGeneration !== generation) return;
           } else {
             // Fallback to loading next if history position invalid
             await this._loadNext();
+            if (this._initGeneration !== generation) return;
           }
         } else {
           this._log('Loading first media');
-          
           // V5.3: Smart pre-load - only for small collections
           await this._smartPreloadNavigationQueue();
-          
+          if (this._initGeneration !== generation) return;
           await this._loadNext();
+          if (this._initGeneration !== generation) return;
         }
         
         // V5.5: Auto-open queue preview if configured
@@ -4832,11 +6485,21 @@ class MediaCard extends LitElement {
           });
         }
       } else {
-        console.error('[MediaCard] Provider initialization failed');
-        this._errorState = 'Provider initialization failed';
+        const reason = this.provider?.emptyReason;
+        if (reason === 'filtered' || reason === 'empty_collection') {
+          // Not a real error — the query legitimately found no matches. Show the
+          // friendly "no media" placeholder (with filter controls) instead of trapping
+          // the user behind a fatal error banner with no way to adjust filters.
+          this._log(`Provider found no items (${reason})`);
+          this._noResultsReason = reason;
+          this.currentMedia = null;
+        } else {
+          console.error('[MediaViewerCard] Provider initialization failed');
+          this._errorState = 'Provider initialization failed';
+        }
       }
     } catch (error) {
-      console.error('[MediaCard] Error initializing provider:', error);
+      console.error('[MediaViewerCard] Error initializing provider:', error);
       // V5.3: Store error message for display in card UI
       this._errorState = error.message || 'Provider initialization failed';
     } finally {
@@ -4934,7 +6597,14 @@ class MediaCard extends LitElement {
       // MediaIndexProvider (random mode): Small if initial query returned less than requested
       estimatedSize = actualProvider.queue.length;
       const requestedSize = actualProvider.queueSize || 100;
-      isSmallCollection = estimatedSize < requestedSize;
+      // Use a public provider property for the raw DB count (before local path exclusions)
+      // when available. Fall back to the visible queue size if the provider does not expose it.
+      // This avoids coupling the UI to provider internals while preserving current behavior
+      // for providers that surface the raw count as part of their public contract.
+      const rawCount = actualProvider.lastRawQueryCount !== undefined
+        ? actualProvider.lastRawQueryCount
+        : estimatedSize;
+      isSmallCollection = rawCount < requestedSize;
     }
     
     if (!isSmallCollection) {
@@ -4983,12 +6653,15 @@ class MediaCard extends LitElement {
             location_city: rawItem.location_city,
             location_state: rawItem.location_state,
             location_country: rawItem.location_country,
+            location_country_code: rawItem.location_country_code,
             location_name: rawItem.location_name,
-            has_coordinates: rawItem.has_coordinates || false,
-            is_geocoded: rawItem.is_geocoded || false,
+            has_coordinates: rawItem.latitude != null && rawItem.longitude != null,
+            is_geocoded: !!(rawItem.is_geocoded || rawItem.location_city || rawItem.location_state || rawItem.location_country),
             latitude: rawItem.latitude,
             longitude: rawItem.longitude,
-            is_favorited: rawItem.is_favorited || false
+            is_favorited: rawItem.is_favorited || false,
+            burst_count: rawItem.burst_count || null,
+            burst_favorites: rawItem.burst_favorites || null
           }
         };
         
@@ -5004,37 +6677,72 @@ class MediaCard extends LitElement {
 
   // V5: Unified navigation - card owns queue/history, provider just supplies items
   async _loadNext() {
-    // V5.6: Set flag FIRST to ignore video pause events during navigation
-    // The browser auto-pauses videos when they're removed from DOM
-    this._navigatingAway = true;
+    // Clear suppress-lookahead flag on first forward navigation after a shared-queue restore.
+    // This ensures _fillLookahead() is a no-op during init but works normally thereafter.
+    this._suppressLookaheadFill = false;
+    // Clear any pending location retry timers from the previous item
+    this._clearLocationRetryTimers();
+    // V5.6.7: Re-entrance guard - prevent concurrent calls to _loadNext
+    if (this._isLoadingNext) {
+      if (!this._isManualNavigation) {
+        this._log('⏭️ Skipping _loadNext - already in progress');
+        return;
+      }
+      this._log('⏭️ Manual next requested while load is in progress - canceling stale preparation');
+      this._cancelActiveMediaPrepare('manual next');
+      this._isLoadingNext = false;
+    }
+    this._navigationGeneration++;
+    const navigationGeneration = this._navigationGeneration;
+    this._isLoadingNext = true;
+
+    try {
+      // V5.6: Set flag FIRST to ignore video pause events during navigation
+      // The browser auto-pauses videos when they're removed from DOM
+      this._navigatingAway = true;
+
+      // Freeze Roku immediately on manual navigation so the old video doesn't
+      // keep playing (and show the xcast banner) while the new one loads.
+      if (this._isManualNavigation) this._pauseCastForNavigation();
+
+      // Leader election: if the user tapped/swiped on this card, it becomes the
+      // new timer driver for the sync group, displacing any existing leader.
+      // This applies even when locally paused — an explicit button press means the
+      // user wants to control THIS card and it should fetch from its own provider,
+      // not wait for a cross-device broadcast.
+      if (this._isManualNavigation && this.config?.shared_queue_id) {
+        this._claimDriverRole();
+      }
 
     // V5.5: Panel Navigation Override (burst/related/on_this_day use _panelQueue)
     // Queue preview mode uses navigationQueue directly, so skip panel navigation
     if (this._panelOpen && this._panelQueue.length > 0 && this._panelMode !== 'queue') {
       this._navigatingAway = false;
+      this._isLoadingNext = false;
       return await this._loadNextPanel();
     }
     
-    // V5.7: Reset manual page flag when navigating with arrow keys/buttons
+    // V5.6.7: Reset manual page flag when navigating with arrow keys/buttons
     // This allows auto-adjustment to scroll panel to show newly navigated item
     // (Clicking thumbnails keeps _manualPageChange true to prevent flickering)
-    if (this._panelOpen && this._panelMode === 'queue') {
-      this._manualPageChange = false;
-    }
+    // V5.6.7: Skip panel adjustment during auto-advance of videos (prevents flickering)
+    // but allow panel adjustment during manual navigation, even from/to videos
+    // V5.6.8: Simplified - render function now handles resetting _manualPageChange
+    // when navigationIndex comes back onto the visible page
     
     if (!this.provider) {
       this._log('_loadNext called but no provider');
       this._navigatingAway = false;
+      this._isLoadingNext = false;
       return;
     }
 
     // V4: Handle auto_advance_mode when manually navigating
     this._handleAutoAdvanceModeOnNavigate();
 
-    try {
-      // V5.3: Navigation Queue Architecture
-      // Store pending index (will be applied when media loads to sync with metadata)
-      let nextIndex = this.navigationIndex + 1;
+    // V5.3: Navigation Queue Architecture
+    // Store pending index (will be applied when media loads to sync with metadata)
+    let nextIndex = this.navigationIndex + 1;
       
       // Need to load more items?
       if (nextIndex >= this.navigationQueue.length) {
@@ -5055,10 +6763,56 @@ class MediaCard extends LitElement {
           this._pendingNavigationIndex = 0;
         } else {
           this._log('Navigation queue exhausted, loading from provider');
+          const _nowMs = Date.now();
+          const _followerDefer = !this._isManualNavigation &&
+              !this._videoHasEnded &&
+              this._crossDeviceFollowerUntil && _nowMs < this._crossDeviceFollowerUntil;
+          const _reconnectDefer = !this._isManualNavigation &&
+              this._crossDeviceProviderFetchUntil && _nowMs < this._crossDeviceProviderFetchUntil;
+
+          if (_followerDefer) {
+            // Driver is active — it will broadcast when ready.  Return silently
+            // without queuing a retry; the retry was the source of endless noise.
+            // _applySharedQueueUpdate will navigate us when the broadcast arrives.
+            const waitSecs = Math.round((this._crossDeviceFollowerUntil - _nowMs) / 1000);
+            this._log(`⏳ Follower mode: waiting for driver broadcast (${waitSecs}s remaining)`);
+            return;
+          }
+
+          if (_reconnectDefer) {
+            // Reconnect grace: driver may still be active but HA event hasn't arrived yet.
+            // Set a one-shot retry; _applySharedQueueUpdate cancels it if broadcast arrives.
+            const remaining = this._crossDeviceProviderFetchUntil - _nowMs;
+            this._log(`⏳ Cross-device reconnect grace: deferring provider fetch ${remaining}ms`);
+            if (this._crossDeviceGraceRetryTimer) clearTimeout(this._crossDeviceGraceRetryTimer);
+            this._crossDeviceGraceRetryTimer = setTimeout(() => {
+              this._crossDeviceGraceRetryTimer = null;
+              if (!this._isLocallyPaused() && this.navigationIndex >= this.navigationQueue.length - 1) {
+                this._loadNext();
+              }
+            }, remaining + 50);
+            return;
+          }
+
+          this._crossDeviceProviderFetchUntil = 0;
+          // Capture generation before any awaits so we can detect if a sync event
+          // arrived from another card while we were waiting for the provider.
+          const _syncGenBefore = this._syncNavGeneration || 0;
           let item = await this.provider.getNext();
+          let hiddenCompanionAttempts = 0;
+          while (item && await this._shouldHideLivePhotoCompanionVideo(item) && hiddenCompanionAttempts < 25) {
+            this._log('🎞️ Skipping Live Photo companion video in slideshow queue:', item.media_content_id);
+            item = await this.provider.getNext();
+            hiddenCompanionAttempts++;
+          }
+
+          if (navigationGeneration !== this._navigationGeneration) {
+            this._log('⏭️ Discarding stale next-item provider result after newer navigation');
+            return;
+          }
         
           if (item) {
-            this._log('Got item from provider:', item.title);
+            this._log('Got item from provider:', item.filename || item.media_content_id);
           
             // V5.3: Check if item already exists in navigation queue (prevent duplicates)
             let alreadyInQueue = this.navigationQueue.some(q => q.media_content_id === item.media_content_id);
@@ -5068,6 +6822,12 @@ class MediaCard extends LitElement {
             while (alreadyInQueue && attempts < maxAttempts) {
               this._log(`⚠️ Item already in navigation queue (attempt ${attempts + 1}), getting next:`, item.media_content_id);
               item = await this.provider.getNext();
+              hiddenCompanionAttempts = 0;
+              while (item && await this._shouldHideLivePhotoCompanionVideo(item) && hiddenCompanionAttempts < 25) {
+                this._log('🎞️ Skipping Live Photo companion video in slideshow queue:', item.media_content_id);
+                item = await this.provider.getNext();
+                hiddenCompanionAttempts++;
+              }
               if (!item) break;
               alreadyInQueue = this.navigationQueue.some(q => q.media_content_id === item.media_content_id);
               attempts++;
@@ -5076,8 +6836,8 @@ class MediaCard extends LitElement {
             // Log if we hit the safety limit (indicates provider may be stuck)
             if (attempts >= maxAttempts && alreadyInQueue) {
               this._log('⚠️ Max attempts reached in duplicate detection - provider may be returning same item repeatedly');
-              // Treat as provider exhaustion - wrap to beginning
-              this._log('Treating as provider exhaustion, wrapping to beginning');
+              // Treat as provider exhaustion - wrap to beginning with fresh query
+              this._log('Treating as provider exhaustion, wrapping to beginning with refresh');
               
               // Validate queue has items before wrapping
               if (this.navigationQueue.length === 0) {
@@ -5086,20 +6846,12 @@ class MediaCard extends LitElement {
                 return;
               }
               
-              // V5.4: Check for new files before wrapping back to position 1
-              const queueRefreshed = await this._checkForNewFiles();
-              if (queueRefreshed) {
-                // Queue was refreshed and reset to position 1 with new files
-                return;
-              }
-              
-              this._pendingNavigationIndex = 0;
+              // V5.6.8: Do fresh query when wrapping to catch new files
+              await this._wrapToBeginningWithRefresh();
               return;
-            }
-            
-            if (!item || alreadyInQueue) {
+            } else if (!item || alreadyInQueue) {
               // All items are duplicates or provider exhausted, wrap to beginning
-              this._log('Provider exhausted or only returning duplicates, wrapping to beginning');
+              this._log('Provider exhausted or only returning duplicates, wrapping to beginning with refresh');
               
               // Validate queue has items before wrapping
               if (this.navigationQueue.length === 0) {
@@ -5108,37 +6860,53 @@ class MediaCard extends LitElement {
                 return;
               }
               
-              // V5.4: Check for new files before wrapping back to position 1
-              const queueRefreshed = await this._checkForNewFiles();
-              if (queueRefreshed) {
-                // Queue was refreshed and reset to position 1 with new files
+              // V5.6.8: Do fresh query when wrapping to catch new files
+              await this._wrapToBeginningWithRefresh();
+              return;
+            } else {
+              this._log('✅ Adding new item to navigation queue:', item.filename || item.media_content_id);
+          
+              // V5: Extract metadata if not provided
+              if (!item.metadata) {
+                this._log('Extracting metadata for:', item.media_content_id);
+                item.metadata = await this._extractMetadataFromItem(item);
+              }
+          
+              // Add to navigation queue
+              this.navigationQueue.push(item);
+          
+              // Implement sliding window: remove oldest if exceeding max size
+              if (this.navigationQueue.length > this.maxNavQueueSize) {
+                this._log('Navigation queue exceeds max size, removing oldest item');
+                this.navigationQueue.shift();
+                // After shift, point nextIndex to the newly added item (now at end of queue)
+                // We DON'T decrement navigationIndex here because we're intentionally moving
+                // forward to the new item, not staying at the current position
+                nextIndex = this.navigationQueue.length - 1;
+              }
+
+              // Sync mode: if another card already broadcast a new item while we were awaiting
+              // the provider (same-window CustomEvent fires mid-await), follow that card instead.
+              if ((this._syncNavGeneration || 0) > _syncGenBefore) {
+                this._log('🔗 Another synced card broadcast first — following sync navigation, discarding locally-fetched item');
+                // IMPORTANT: also remove the item we just pushed from navigationQueue.
+                // _applySharedQueueUpdate replaced navigationQueue with the driver's queue,
+                // then our push added this item on top.  If we don't remove it, the next
+                // auto-advance will find the queue non-exhausted and navigate to this item
+                // directly — bypassing the follower defer check entirely.
+                this.navigationQueue.pop();
                 return;
               }
-              
-              this._pendingNavigationIndex = 0;
-              return;
-            }
-            
-            this._log('✅ Adding new item to navigation queue:', item.title);
-          
-            // V5: Extract metadata if not provided
-            if (!item.metadata) {
-              this._log('Extracting metadata for:', item.media_content_id);
-              item.metadata = await this._extractMetadataFromItem(item);
-            }
-          
-            // Add to navigation queue
-            this.navigationQueue.push(item);
-          
-            // Implement sliding window: remove oldest if exceeding max size
-            if (this.navigationQueue.length > this.maxNavQueueSize) {
-              this._log('Navigation queue exceeds max size, removing oldest item');
-              this.navigationQueue.shift();
-              this.navigationIndex--; // Adjust index for removed item
+              // We are the "first" card — broadcast our new item immediately so other
+              // same-window cards adopt it synchronously before they exit their own awaits.
+              // Suppress if locally paused (short press) — don't affect the group.
+              if (!this._isLocallyPaused()) {
+                this._earlyBroadcastSyncState(nextIndex);
+              }
             }
           } else {
-            // No more items available from provider, wrap to beginning
-            this._log('Provider exhausted, wrapping to beginning');
+            // No more items available from provider, wrap to beginning with fresh query
+            this._log('Provider exhausted, wrapping to beginning with refresh');
             
             // Validate queue has items before wrapping
             if (this.navigationQueue.length === 0) {
@@ -5147,16 +6915,9 @@ class MediaCard extends LitElement {
               return;
             }
             
-            // V5.4: Check for new files before wrapping back to position 1
-            const queueRefreshed = await this._checkForNewFiles();
-            if (queueRefreshed) {
-              // Queue was refreshed and reset to position 1 with new files
-              return;
-            }
-            
-            // V5.6.4: Update nextIndex to 0 after wrapping (matches pattern at line 1258)
-            nextIndex = 0;
-            this._pendingNavigationIndex = 0;
+            // V5.6.8: Do fresh query when wrapping to catch new files
+            await this._wrapToBeginningWithRefresh();
+            return;
           }
         }
       }
@@ -5168,13 +6929,46 @@ class MediaCard extends LitElement {
         return;
       }
       
+      if (await this._shouldHideLivePhotoCompanionVideo(item)) {
+        this._log('🎞️ Removing Live Photo companion video from navigation queue:', item.media_content_id);
+        this._removeItemFromQueues(item);
+        this._isLoadingNext = false;
+        setTimeout(() => this._loadNext(), 0);
+        return;
+      }
+
+      if (navigationGeneration !== this._navigationGeneration) {
+        this._log('⏭️ Discarding stale next navigation before display');
+        return;
+      }
+
+      // V5.6.8: Increment periodic refresh counter and check if refresh needed
+      // Works for both sequential and random modes - provider handles mode-specific logic
+      this._itemsSinceRefresh++;
+      if (this._itemsSinceRefresh >= this._periodicRefreshInterval) {
+        this._log(`🔄 Periodic refresh triggered after ${this._itemsSinceRefresh} items (interval: ${this._periodicRefreshInterval})`);
+        // Reset counter immediately to prevent multiple triggers
+        this._itemsSinceRefresh = 0;
+        // Do refresh in background (non-blocking) to check for new files
+        this._doPeriodicRefresh().catch(err => this._log('⚠️ Periodic refresh failed:', err));
+      }
+      
       // Extract filename from path for logging
       const filename = item.metadata?.filename || item.media_content_id?.split('/').pop() || 'unknown';
       this._log('Displaying navigation queue item:', filename, 'at index', nextIndex);
-      
+
+      // Slide the window when navigating into pre-loaded lookahead items:
+      // trim oldest back-history to keep navigationIndex within maxNavQueueSize bounds.
+      while (nextIndex >= this.maxNavQueueSize) {
+        this.navigationQueue.shift();
+        nextIndex--;
+      }
+
       // Store pending index (will apply when media loads)
       this._pendingNavigationIndex = nextIndex;
-      
+      // Pre-populate queue so Queue Preview always shows upcoming items
+      this._fillLookahead();
+
       // Add to history for tracking (providers use this for exclusion)
       // Check by media_content_id to avoid duplicate object references
       const alreadyInHistory = this.history.some(h => h.media_content_id === item.media_content_id);
@@ -5206,9 +7000,10 @@ class MediaCard extends LitElement {
       }
       
       // Display the item
+      this._clearLivePhotoPlayback();
       this.currentMedia = item;
       
-      // V5.7: Store in pending state - will apply when image/video loads (syncs all overlays)
+      // V5.6.7: Store in pending state - will apply when image/video loads (syncs all overlays)
       this._pendingMediaPath = item.media_content_id;
       this._pendingMetadata = item.metadata || null;
       
@@ -5216,45 +7011,82 @@ class MediaCard extends LitElement {
       this._fullMetadata = null;
       this._folderDisplayCache = null;
       
+      // Mark that a manual navigation is pending load — keeps _isManualNavigation
+      // semantics alive through the async image/video load phase so that any HA
+      // sync event arriving before _onMediaLoaded fires does not re-enter follower
+      // mode and suppress this card's own HA write.
+      if (this._isManualNavigation) this._manualNavLoading = true;
+
       await this._resolveMediaUrl();
       this.requestUpdate();
-      
-      // V5: Setup auto-advance after successfully loading media
-      this._setupAutoRefresh();
 
-      // V5.6: Clear navigation flag after render cycle completes
-      // Use setTimeout to ensure old video element is removed from DOM first
-      setTimeout(() => {
-        this._navigatingAway = false;
-      }, 0);
+      // V5.6.7: Don't clear _navigatingAway here - let _onVideoCanPlay/_onMediaLoaded clear it
+      // when the new media actually loads. Clearing it early causes timer to fire prematurely
+      // for short videos that end before the next video reaches canplay state.
 
       // NOTE: Do NOT restart timer here - let it expire naturally during slideshow
       // Timer only restarts on manual button clicks
 
-      // Refresh metadata from media_index in background after navigation
-      // Ensures overlay reflects latest EXIF/location/favorite flags
-      this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
-    } catch (error) {
-      console.error('[MediaCard] Error loading next media:', error);
-    }
+    // Refresh metadata from media_index in background after navigation
+    // Ensures overlay reflects latest EXIF/location/favorite flags
+    this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+  } catch (error) {
+    console.error('[MediaViewerCard] Error loading next media:', error);
+    this._manualNavLoading = false; // Safety: clear on exception
+  } finally {
+    // V5.6.7: Always clear re-entrance guard
+    this._isLoadingNext = false;
+    // Clear the in-flight flag. _manualNavLoading covers the remaining async load phase.
+    this._isManualNavigation = false;
   }
+}
 
   async _loadPrevious() {
-    // V5.6: Set flag FIRST to ignore video pause events during navigation
-    this._navigatingAway = true;
+    // Clear any pending location retry timers from the previous item
+    this._clearLocationRetryTimers();
+    // V5.6.7: Re-entrance guard - prevent concurrent calls to _loadPrevious
+    if (this._isLoadingNext) {
+      if (!this._isManualNavigation) {
+        this._log('⏮️ Skipping _loadPrevious - already in progress');
+        return;
+      }
+      this._log('⏮️ Manual previous requested while load is in progress - canceling stale preparation');
+      this._cancelActiveMediaPrepare('manual previous');
+      this._isLoadingNext = false;
+    }
+    this._navigationGeneration++;
+    const navigationGeneration = this._navigationGeneration;
+    this._isLoadingNext = true;
 
-    // V5.5: Panel Navigation Override (burst/related/on_this_day use _panelQueue)
-    // Queue preview mode uses navigationQueue directly, so skip panel navigation
-    if (this._panelOpen && this._panelQueue.length > 0 && this._panelMode !== 'queue') {
-      this._navigatingAway = false;
-      return await this._loadPreviousPanel();
-    }
+    try {
+      // V5.6: Set flag FIRST to ignore video pause events during navigation
+      this._navigatingAway = true;
+
+      // Freeze Roku immediately on manual navigation so the old video doesn't
+      // keep playing (and show the xcast banner) while the new one loads.
+      if (this._isManualNavigation) this._pauseCastForNavigation();
+
+      // Leader election: if the user tapped/swiped on this card, it becomes the
+      // new timer driver for the sync group, displacing any existing leader.
+      // This applies even when locally paused — an explicit button press means the
+      // user wants to control THIS card.
+      if (this._isManualNavigation && this.config?.shared_queue_id) {
+        this._claimDriverRole();
+      }
+
+      // V5.5: Panel Navigation Override (burst/related/on_this_day use _panelQueue)
+      // Queue preview mode uses navigationQueue directly, so skip panel navigation
+      if (this._panelOpen && this._panelQueue.length > 0 && this._panelMode !== 'queue') {
+        this._navigatingAway = false;
+        this._isLoadingNext = false;
+        return await this._loadPreviousPanel();
+      }
     
-    // V5.7: Reset manual page flag when navigating with arrow keys/buttons
+    // V5.6.7: Reset manual page flag when navigating with arrow keys/buttons
     // This allows auto-adjustment to scroll panel to show newly navigated item
-    if (this._panelOpen && this._panelMode === 'queue') {
-      this._manualPageChange = false;
-    }
+    // (Same logic as _loadNext for consistency)
+    // V5.6.8: Simplified - render function now handles resetting _manualPageChange
+    // when navigationIndex comes back onto the visible page
     
     if (!this.provider) {
       this._log('_loadPrevious called but no provider');
@@ -5288,11 +7120,17 @@ class MediaCard extends LitElement {
     }
     
     this._log('Going back to navigation queue item:', item.title, 'at index', this.navigationIndex);
+
+    if (navigationGeneration !== this._navigationGeneration) {
+      this._log('⏮️ Discarding stale previous navigation before display');
+      return;
+    }
     
     // Display the item
+    this._clearLivePhotoPlayback();
     this.currentMedia = item;
     
-    // V5.7: Store in pending state - will apply when image/video loads (syncs all overlays)
+    // V5.6.7: Store in pending state - will apply when image/video loads (syncs all overlays)
     this._pendingNavigationIndex = this.navigationIndex;
     this._pendingMediaPath = item.media_content_id;
     this._pendingMetadata = item.metadata || null;
@@ -5300,7 +7138,11 @@ class MediaCard extends LitElement {
     // V5: Clear cached full metadata when media changes
     this._fullMetadata = null;
     this._folderDisplayCache = null;
-    
+
+    // Mark that a manual navigation is pending load — keeps _isManualNavigation
+    // semantics alive through the async image/video load phase.
+    if (this._isManualNavigation) this._manualNavLoading = true;
+
     await this._resolveMediaUrl();
     this.requestUpdate();
     
@@ -5315,13 +7157,31 @@ class MediaCard extends LitElement {
     }
     // Images: Timer deferred to _onMediaLoaded() to prevent premature expiration
 
-    // V5.6: Clear navigation flag after render cycle completes
-    setTimeout(() => {
-      this._navigatingAway = false;
-    }, 0);
+      // V5.6: Clear navigation flag after render cycle completes.
+      // For videos, _onVideoCanPlay is the correct clearing point (it fires once the
+      // media has actually committed to the DOM). Clearing here for videos would race
+      // against the stale _suppressCastPushOnCanplay flag and silently skip the cast push.
+      if (!isVideo) {
+        setTimeout(() => {
+          this._navigatingAway = false;
+        }, 0);
+      }
 
-    // NOTE: Do NOT restart timer here - let it expire naturally during slideshow
-    // Timer only restarts on manual button clicks
+      // NOTE: Do NOT restart timer here - let it expire naturally during slideshow
+      // Timer only restarts on manual button clicks
+
+    // Refresh metadata from media_index in background after backward navigation
+    // Ensures overlay (burst count, location, favorites) reflects latest data
+    this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+    } catch (error) {
+      console.error('[MediaViewerCard] Error loading previous media:', error);
+      this._manualNavLoading = false; // Safety: clear on exception
+    } finally {
+      // V5.6.7: Always clear re-entrance guard
+      this._isLoadingNext = false;
+      // Clear the in-flight flag. _manualNavLoading covers the remaining async load phase.
+      this._isManualNavigation = false;
+    }
   }
 
   // V4: Handle auto_advance_mode behavior when user manually navigates
@@ -5378,16 +7238,18 @@ class MediaCard extends LitElement {
 
   async _loadPanelItem(index) {
     // V5.6: Set flag to ignore video pause events during thumbnail click
+    this._navigationGeneration++;
+    this._cancelActiveMediaPrepare('panel navigation');
     this._navigatingAway = true;
     
     const item = this._panelQueue[index];
     if (!item) {
-      console.error('[MediaCard] No item at panel index:', index);
+      console.error('[MediaViewerCard] No item at panel index:', index);
       this._navigatingAway = false;
       return;
     }
     
-    console.log('[MediaCard] 📱 Loading panel item', index + 1, '/', this._panelQueue.length, ':', item.filename || item.path, 'Panel mode:', this._panelMode);
+    console.log('[MediaViewerCard] 📱 Loading panel item', index + 1, '/', this._panelQueue.length, ':', item.filename || item.path, 'Panel mode:', this._panelMode);
     
     // Update panel index
     this._panelQueueIndex = index;
@@ -5405,17 +7267,18 @@ class MediaCard extends LitElement {
     
     // Update current media - THIS IS CRITICAL for main image display
     const mediaUri = item.media_source_uri || item.path;
+    this._clearLivePhotoPlayback();
     this.currentMedia = {
       media_content_id: mediaUri,
       media_content_type: item.filename?.toLowerCase().endsWith('.mp4') ? 'video' : 'image',
       metadata: metadata
     };
     
-    // V5.7: Store in pending state - will apply when image/video loads
+    // V5.6.7: Store in pending state - will apply when image/video loads
     this._pendingMediaPath = mediaUri;
     this._pendingMetadata = metadata;
     
-    // V5.7: Panel navigation doesn't use queue navigation indices - set to special marker
+    // V5.6.7: Panel navigation doesn't use queue navigation indices - set to special marker
     // This tells _resolveMediaUrl to skip stale navigation checks (only relevant for queue nav)
     this._pendingNavigationIndex = -1; // -1 = panel navigation, not queue navigation
     
@@ -5432,16 +7295,21 @@ class MediaCard extends LitElement {
     await this._resolveMediaUrl();
     this.requestUpdate();
     
-    // Clear navigation flag after display updates
-    this._navigatingAway = false;
+    // For videos, _onVideoCanPlay clears _navigatingAway once the media commits to the DOM.
+    // Clearing it here races against a stale _suppressCastPushOnCanplay flag and causes
+    // the cast push to be silently skipped.
+    if (!this._isVideoFile(mediaUri)) this._navigatingAway = false;
   }
 
   async _jumpToQueuePosition(queueIndex) {
     // V5.6: Set flag to ignore video pause events during thumbnail click
+    this._navigationGeneration++;
+    this._cancelActiveMediaPrepare('queue jump');
     this._navigatingAway = true;
+    this._pauseCastForNavigation(); // always manual — freeze Roku before new video loads
     
     if (!this.navigationQueue || queueIndex < 0 || queueIndex >= this.navigationQueue.length) {
-      console.error('[MediaCard] Invalid queue position:', queueIndex);
+      console.error('[MediaViewerCard] Invalid queue position:', queueIndex);
       this._navigatingAway = false;
       return;
     }
@@ -5458,9 +7326,10 @@ class MediaCard extends LitElement {
 
     // Load the item from the queue
     const item = this.navigationQueue[queueIndex];
+    this._clearLivePhotoPlayback();
     this.currentMedia = item;
     
-    // V5.7: Store in pending state - will apply when image/video loads  
+    // V5.6.7: Store in pending state - will apply when image/video loads  
     this._pendingNavigationIndex = queueIndex;
     this._pendingMediaPath = item.media_content_id;
     this._pendingMetadata = item.metadata || null;
@@ -5473,11 +7342,73 @@ class MediaCard extends LitElement {
     await this._resolveMediaUrl();
     this.requestUpdate();
     
-    // Clear navigation flag after display updates
-    this._navigatingAway = false;
+    // For videos, _onVideoCanPlay clears _navigatingAway once the media commits to the DOM.
+    // Clearing it here races against a stale _suppressCastPushOnCanplay flag and causes
+    // the cast push to be silently skipped.
+    if (!this._isVideoFile(item.media_content_id)) this._navigatingAway = false;
     
     // V5: Setup auto-advance after jumping to position
     this._setupAutoRefresh();
+  }
+
+  /**
+   * Remove an item from the navigation queue ("Skip session" in queue panel).
+   * Excludes from provider so the item won't reappear this session.
+   */
+  _removeFromQueue(actualIndex) {
+    if (actualIndex < 0 || actualIndex >= this.navigationQueue.length) return;
+    const removed = this.navigationQueue.splice(actualIndex, 1)[0];
+    if (actualIndex < this.navigationIndex) {
+      this.navigationIndex--;
+      if (this._pendingNavigationIndex !== null) this._pendingNavigationIndex--;
+    }
+    if (this.provider && typeof this.provider.excludeFile === 'function') {
+      const path = removed.metadata?.path || removed.path;
+      const uri  = removed.media_source_uri || removed.media_content_id;
+      if (path) this.provider.excludeFile(path);
+      if (uri && uri !== path) this.provider.excludeFile(uri);
+    }
+    this._log('⏭ Skipped from queue:', removed.metadata?.filename || removed.media_content_id);
+    this._fillLookahead();
+    this.requestUpdate();
+  }
+
+  /**
+   * Remove an item from the panel queue ("Remove from panel" for non-queue panels).
+   * Does NOT exclude from provider — item may still appear in the main slideshow.
+   */
+  _removeFromPanelQueue(actualIndex) {
+    if (actualIndex < 0 || actualIndex >= this._panelQueue.length) return;
+    const removed = this._panelQueue.splice(actualIndex, 1)[0];
+    if (actualIndex < this._panelQueueIndex) {
+      this._panelQueueIndex--;
+    }
+    this._log('⏭ Removed from panel:', removed.filename || removed.path);
+    this.requestUpdate();
+  }
+
+  /**
+   * Open delete confirmation for a thumbnail menu action.
+   */
+  async _handleThumbnailMenuDelete(item) {
+    const path = item.media_source_uri || item.media_content_id || (item.path ? `media-source://media_source${item.path}` : null);
+    if (!path) return;
+    // Prefer the already-resolved URL from the thumbnail strip; fall back to a fresh resolve
+    const thumbUrl  = item._resolvedUrl || await this._getMediaThumbnail(path);
+    const filename  = item.metadata?.filename ?? item.filename ?? path.split('/').pop();
+    this._showDeleteConfirmation(path, thumbUrl, filename);
+  }
+
+  /**
+   * Open edit confirmation for a thumbnail menu action.
+   */
+  async _handleThumbnailMenuEdit(item) {
+    const path = item.media_source_uri || item.media_content_id || (item.path ? `media-source://media_source${item.path}` : null);
+    if (!path) return;
+    // Prefer the already-resolved URL from the thumbnail strip; fall back to a fresh resolve
+    const thumbUrl  = item._resolvedUrl || await this._getMediaThumbnail(path);
+    const filename  = item.metadata?.filename ?? item.filename ?? path.split('/').pop();
+    this._showEditConfirmation(path, thumbUrl, filename);
   }
 
   /**
@@ -5595,6 +7526,13 @@ class MediaCard extends LitElement {
       return;
     }
 
+    // Leader election: followers in a sync group must not run their own timer.
+    // The leader broadcasts navigation events; followers apply them via _applySharedQueueUpdate.
+    if (this.config?.shared_queue_id && !this._isSyncLeader()) {
+      this._log('👥 Sync follower — timer suppressed (leader handles advance)');
+      return;
+    }
+
     // V5: Get refresh/advance seconds based on mode
     // Single media: use auto_refresh_seconds
     // Folder/slideshow: prefer auto_advance_seconds, fallback to auto_refresh_seconds
@@ -5664,7 +7602,67 @@ class MediaCard extends LitElement {
         
         // Check pause states before advancing
         if (!this._isPaused && !this._backgroundPaused) {
-          // Reset pause log flag (timer is active again)
+          // V5.6.7: Skip timer callback while navigating to new media
+          // This prevents the timer from calling _loadNext() while the new video is still loading
+          // (which happens when video is paused/buffering and timer fires before canplay event)
+          if (this._navigatingAway) {
+            this._log('⏱️ Timer skipped - navigation in progress');
+            return;
+          }
+
+          // Increment the video timer counter BEFORE follower checks so that elapsed
+          // time accumulates even while this card is acting as a cross-device follower.
+          // This ensures max_video_duration is enforced even if the leader goes away.
+          const videoElement = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+          const maxDuration = this.config.video_max_duration;
+          if (videoElement && !videoElement.paused && !videoElement.ended) {
+            this._videoTimerCount = (this._videoTimerCount || 0) + 1;
+          }
+          const elapsedSeconds = (this._videoTimerCount || 0) * refreshSeconds;
+
+          // Cross-device follower: skip auto-advance while another device is the driver.
+          // Exception: if max_video_duration is set and has been reached AND the leader has
+          // missed a full timer interval without syncing, claim driver and advance.
+          // The "missed a full interval" guard is critical: when all followers reset their
+          // _videoTimerCount at the same time (via the same sync event), they all hit
+          // elapsed >= maxDuration on the same timer tick. Without this check, two followers
+          // claim driver simultaneously. Requiring sinceLastSync > refreshSeconds ensures
+          // only a genuinely absent leader triggers takeover — an active leader syncs every
+          // refreshSeconds, so sinceLastSync will never exceed refreshSeconds while it's alive.
+          if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+            const sinceLastSync = this._lastLeaderSyncReceivedAt
+              ? Date.now() - this._lastLeaderSyncReceivedAt
+              : Infinity;
+            if (maxDuration && maxDuration > 0 && elapsedSeconds >= maxDuration && !this._videoUserInteracted
+                && sinceLastSync > refreshSeconds * 1500) {
+              this._claimDriverRole();
+              this._log(`\u{1f465} Cross-device follower \u2014 max_video_duration (${maxDuration}s) exceeded and leader missed an interval (${Math.round(sinceLastSync / 1000)}s since last sync), taking over as driver`);
+              // fall through to advance
+            } else {
+              this._log('\u{1f465} Cross-device follower \u2014 skipping auto-advance (leader drives)');
+              return;
+            }
+          }
+          // Follower window expired, but if we're still showing the same media the leader
+          // last sent, the leader may be mid-video (longer than the window). Only renew the
+          // window if:
+          //   1. The leader actually sent a sync within the past 2 minutes (leader is alive)
+          //   2. max_video_duration is not set or not yet reached
+          // Without condition 1, followers whose leader has gone away renew their own windows
+          // indefinitely, leaving all cards stuck in follower mode forever.
+          const _leaderIsAlive = this._lastLeaderSyncReceivedAt &&
+              Date.now() - this._lastLeaderSyncReceivedAt < 120000;
+          if (_leaderIsAlive && this._hasCrossDeviceSync() && this._crossDeviceLeaderMediaPath &&
+              this._currentMediaPath === this._crossDeviceLeaderMediaPath) {
+            if (!maxDuration || elapsedSeconds < maxDuration) {
+              this._crossDeviceFollowerUntil = Date.now() + 120000;
+              this._log('\u{1f465} Cross-device follower \u2014 window renewed (still on leader media, long video)'); 
+              return;
+            }
+            // max_video_duration reached — claim driver role and advance
+            this._claimDriverRole();
+            this._log(`\u{1f465} Cross-device follower \u2014 max_video_duration (${maxDuration}s) reached after window expiry, advancing`);
+          }
           this._pauseLogShown = false;
           
           // Check for new files FIRST (before video completion check)
@@ -5683,22 +7681,19 @@ class MediaCard extends LitElement {
           // - Short videos that loop: advance on FIRST timer fire after loop detected
           // - Long videos with max_duration: advance when timer count * interval >= max_duration
           // - Long videos without max_duration: never advance on timer (play to completion)
-          const videoElement = this.shadowRoot?.querySelector('video');
-          const maxDuration = this.config.video_max_duration;
-          
+          // Note: videoElement, maxDuration, _videoTimerCount increment, and elapsedSeconds
+          // are all handled above — no need to re-query or re-increment here.
+
           // Check if video is currently playing
           if (videoElement && !videoElement.paused && !videoElement.ended) {
-            // Increment timer counter for this video
-            this._videoTimerCount = (this._videoTimerCount || 0) + 1;
-            
             const currentTime = Math.round(videoElement.currentTime * 10) / 10;
             const duration = Math.round(videoElement.duration * 10) / 10;
-            const elapsedSeconds = this._videoTimerCount * refreshSeconds;
             this._log(`🎬 Timer fired #${this._videoTimerCount}: video at ${currentTime}s/${duration}s, hasEnded=${this._videoHasEnded}, elapsed≈${elapsedSeconds}s, maxDuration=${maxDuration}, userInteracted=${this._videoUserInteracted}`);
             
             // V5.6.4: If user interacted (pause, seek, click), let video play to completion
             if (this._videoUserInteracted && !this._videoHasEnded) {
               this._log('🎬 User interacted with video - playing to completion (ignoring timer/max_duration)');
+              this._writeVideoKeepaliveSync('Video still playing to completion');
               return;
             }
             
@@ -5712,6 +7707,7 @@ class MediaCard extends LitElement {
             else if (maxDuration && maxDuration > 0) {
               if (elapsedSeconds < maxDuration) {
                 this._log(`🎬 Timer #${this._videoTimerCount}: elapsed≈${elapsedSeconds}s < max ${maxDuration}s - CONTINUING`);
+                this._writeVideoKeepaliveSync('Video still playing before max duration');
                 return; // Keep playing
               } else {
                 this._log(`🎬 Timer #${this._videoTimerCount}: elapsed≈${elapsedSeconds}s ≥ max ${maxDuration}s - INTERRUPTING`);
@@ -5721,6 +7717,7 @@ class MediaCard extends LitElement {
             // Priority 3: No max_video_duration and not ended - let video play
             else {
               this._log('🎬 Video playing to completion - IGNORING TIMER');
+              this._writeVideoKeepaliveSync('Video still playing to completion');
               return; // Let it play to completion
             }
           }
@@ -5757,6 +7754,166 @@ class MediaCard extends LitElement {
         // Normal startup - use setInterval from the beginning
         this._refreshInterval = setInterval(timerCallback, intervalMs);
       }
+    }
+  }
+
+  /**
+   * V5.6.8: Wrap to beginning with fresh query
+   * Called when reaching the end of the slideshow to loop back with updated data.
+   * This ensures new files are detected on every loop iteration.
+   * @returns {Promise<void>}
+   */
+  async _wrapToBeginningWithRefresh() {
+    this._log('🔄 Wrapping to beginning with fresh query...');
+    
+    // V5.6.8: Remember total items seen before wrap (for position indicator)
+    // This prevents "1 of 30" after wrap when user saw 86 items
+    if (this.navigationQueue.length > 0) {
+      this._totalItemsInLoop = this.navigationQueue.length;
+      this._log(`🔄 Remembering ${this._totalItemsInLoop} items in loop for position indicator`);
+    }
+    
+    // Reset provider to clear cursor and start fresh
+    if (this.provider && typeof this.provider.reset === 'function') {
+      this._log('🔄 Resetting provider for fresh query');
+      await this.provider.reset();
+    }
+    
+    // V5.6.8: DON'T clear navigation queue - keep it for back navigation
+    // Just get fresh items from provider and prepend to queue
+    // The user can still navigate back through previously seen items
+    
+    // Get first item from fresh provider
+    const firstItem = await this.provider.getNext();
+    if (!firstItem) {
+      this._log('🔄 Provider exhausted during refresh');
+      this._errorState = 'No media available after refresh';
+      return;
+    }
+    
+    // Extract metadata if needed
+    if (!firstItem.metadata) {
+      firstItem.metadata = await this._extractMetadataFromItem(firstItem);
+    }
+    
+    // V5.6.8: Insert at beginning of queue (after current items if navigating back)
+    // Or just set as current if queue is at end
+    // Find if this item already exists in queue
+    const existingIndex = this.navigationQueue.findIndex(item => 
+      item.media_content_id === firstItem.media_content_id
+    );
+    
+    if (existingIndex >= 0) {
+      // Item already in queue - refresh its metadata with fresh data from provider and jump to it
+      this._log(`🔄 First item already in queue at index ${existingIndex}, jumping to it`);
+      if (firstItem.metadata) {
+        this.navigationQueue[existingIndex].metadata = firstItem.metadata;
+      }
+      this.navigationIndex = existingIndex;
+    } else {
+      // New item - add to end and navigate to it
+      this.navigationQueue.push(firstItem);
+      this.navigationIndex = this.navigationQueue.length - 1;
+      this._log(`🔄 Added fresh item to queue, now at index ${this.navigationIndex}`);
+    }
+    
+    // Trim queue if too large (remove oldest items from front)
+    while (this.navigationQueue.length > this.maxNavQueueSize) {
+      this.navigationQueue.shift();
+      this.navigationIndex--;
+    }
+    
+    this._log(`🔄 Queue has ${this.navigationQueue.length} items after refresh`);
+    
+    // V5.6.8: Reset periodic refresh counter
+    this._itemsSinceRefresh = 0;
+    
+    const currentItem = this.navigationQueue[this.navigationIndex];
+    this._pendingNavigationIndex = this.navigationIndex;
+    
+    // Display the media
+    const filename = currentItem.metadata?.filename || currentItem.media_content_id?.split('/').pop() || 'unknown';
+    this._log('🔄 Displaying first item after refresh:', filename);
+    
+    // Add to history
+    const alreadyInHistory = this.history.some(h => h.media_content_id === currentItem.media_content_id);
+    if (!alreadyInHistory) {
+      this.history.push(currentItem);
+    }
+    
+    // Display the media (same pattern as _loadNext)
+    this._clearLivePhotoPlayback();
+    this.currentMedia = currentItem;
+    this._pendingMediaPath = currentItem.media_content_id;
+    this._pendingMetadata = currentItem.metadata || null;
+    this._fullMetadata = null;
+    this._folderDisplayCache = null;
+    
+    await this._resolveMediaUrl();
+    this.requestUpdate();
+
+    // Refresh metadata from media_index in background (same as _loadNext)
+    this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+  }
+
+  /**
+   * V5.6.8: Periodic refresh - check for new files without disrupting playback
+   * Called every slideshow_window items to detect new files.
+   * Unlike _wrapToBeginningWithRefresh(), this doesn't clear the queue or change position.
+   * It queries the provider for any files newer than the current first item in queue.
+   */
+  async _doPeriodicRefresh() {
+    this._log('🔄 Periodic refresh - checking for new files...');
+    
+    // Check if provider supports checkForNewFiles
+    if (!this.provider) {
+      this._log('🔄 No provider available for periodic refresh');
+      return;
+    }
+    
+    // Try provider directly first (FolderProvider delegates internally)
+    // Also try sequentialProvider for wrapped providers
+    const checkProvider = this.provider.checkForNewFiles ? this.provider :
+                          (this.provider.sequentialProvider?.checkForNewFiles ? this.provider.sequentialProvider :
+                           (this.provider.subfolderQueue?.checkForNewFiles ? this.provider.subfolderQueue : null));
+    
+    if (!checkProvider || typeof checkProvider.checkForNewFiles !== 'function') {
+      this._log('🔄 Provider type does not support checkForNewFiles - periodic refresh skipped');
+      return;
+    }
+    
+    const newItems = await checkProvider.checkForNewFiles();
+    if (newItems && newItems.length > 0) {
+      this._log(`🔄 Found ${newItems.length} new files during periodic refresh`);
+      
+      // Prepend new items to the navigation queue (they're newer = come first in descending order)
+      // But we need to be careful about where in the queue to add them
+      // For descending date order: new files should go at the beginning
+      
+      for (const item of newItems) {
+        // Check if already in queue OR already seen in session history
+        const alreadyInQueue = this.navigationQueue.some(q => q.media_content_id === item.media_content_id);
+        const alreadyInHistory = this.history.some(h => h.media_content_id === item.media_content_id);
+        if (!alreadyInQueue && !alreadyInHistory) {
+          // Extract metadata if needed
+          if (!item.metadata) {
+            item.metadata = await this._extractMetadataFromItem(item);
+          }
+          // Add to beginning of queue (newest first for descending date order)
+          this.navigationQueue.unshift(item);
+          // Adjust navigation index since we added before current position
+          this.navigationIndex++;
+          this._pendingNavigationIndex = this.navigationIndex;
+          this._log(`🔄 Added new file to queue: ${item.metadata?.filename || item.media_content_id}`);
+        }
+      }
+      
+      // Trim queue if exceeds max size (remove oldest = end of array)
+      while (this.navigationQueue.length > this.maxNavQueueSize) {
+        this.navigationQueue.pop();
+      }
+    } else {
+      this._log('🔄 No new files found during periodic refresh');
     }
   }
 
@@ -6000,6 +8157,7 @@ class MediaCard extends LitElement {
         // Check if we should display this new first item
         const shouldUpdate = !currentMediaId || firstItem.media_content_id !== currentMediaId;
         
+        this._clearLivePhotoPlayback();
         this.currentMedia = firstItem;
         
         // CRITICAL: Update _currentMetadata and _currentMediaPath for overlay display
@@ -6017,7 +8175,7 @@ class MediaCard extends LitElement {
           await this.updateComplete; // Wait for Lit to finish rendering
           
           // Check if it's a video or image and reload appropriately
-          const videoElement = this.shadowRoot?.querySelector('video');
+          const videoElement = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
           const imgElement = this.shadowRoot?.querySelector('.media-container > img');
           
           if (videoElement) {
@@ -6073,6 +8231,12 @@ class MediaCard extends LitElement {
       return url;
     }
     
+    // Respect disable_cache_busting option — skip automatic timestamp to allow browser caching.
+    // forceAdd (manual refresh) still bypasses this so the user always gets fresh content.
+    if (!forceAdd && this.config?.disable_cache_busting) {
+      return url;
+    }
+    
     // For auto-refresh: only add if refresh configured
     // For manual refresh: always add (forceAdd = true)
     const refreshSeconds = this.config.auto_refresh_seconds || 0;
@@ -6103,17 +8267,30 @@ class MediaCard extends LitElement {
       );
       
       if (freshMetadata) {
-        // V5.6.5: If we have pending metadata, update that instead of current
-        // This prevents refreshed metadata from being applied before media loads
-        if (this._pendingMetadata !== null) {
-          // Merge with pending metadata (which contains path-based metadata)
+        // TOCTOU guard: by the time the async fetch returns the card may have navigated
+        // to a different item. Only apply if targetPath still matches the active path.
+        const stillActive = this._pendingMediaPath === targetPath ||
+                            this._currentMediaPath === targetPath;
+        if (!stillActive) {
+          this._log('📊 Metadata refresh discarded - card navigated away before result returned');
+          return;
+        }
+
+        // V5.6.5: If we have pending metadata for the SAME item, update it instead of current.
+        // This prevents refreshed metadata from being applied before media loads.
+        // TOCTOU guard: _pendingMetadata may belong to the NEXT item (C) while this refresh
+        // was triggered for the item that just finished displaying (B). Only merge into
+        // pending when the pending path matches the refreshed path; otherwise fall through
+        // to update the still-visible current metadata so B's overlay stays accurate.
+        if (this._pendingMetadata !== null && this._pendingMediaPath === targetPath) {
+          // Merge with pending metadata for the same item
           this._pendingMetadata = {
             ...this._pendingMetadata,
             ...freshMetadata
           };
           this._log('📊 Refreshed metadata from media_index (applied to pending)');
         } else {
-          // No pending state - apply directly to current
+          // Either no pending state, or pending is for a different item — apply to current
           this._currentMetadata = {
             ...this._currentMetadata,
             ...freshMetadata
@@ -6128,37 +8305,392 @@ class MediaCard extends LitElement {
         }
         
         this.requestUpdate();
+
+        // V5.9: Burst group resolution tracking (only when auto_select_burst_favorite is on).
+        // When a favorite from a burst group is confirmed by the DB, there is nothing
+        // further to do on the card side — the backend already filtered out non-favorites
+        // before they reached the queue (auto_select_burst_favorite param to get_random_items).
+
+        // For video files missing GPS/location data, schedule automatic retries in case the
+        // backend processes GPS extraction and geocoding asynchronously after initial indexing.
+        // This is particularly relevant for newly-indexed videos where the backend may not have
+        // finished extracting EXIF GPS data at the time the item first appeared in the queue.
+        const LOCATION_RETRY_DELAY_FIRST = 15000;  // 15 s — covers fast async processing
+        const LOCATION_RETRY_DELAY_SECOND = 60000; // 60 s — covers slower background scans
+        const cleanPath = targetPath ? targetPath.split('?')[0] : '';
+        const isVideoPath = cleanPath && MediaUtils.detectFileType(cleanPath) === 'video';
+        // Only retry when ALL location fields are absent — skip if any partial data is available
+        const missingGps = freshMetadata &&
+          !freshMetadata.has_coordinates &&
+          !freshMetadata.location_city &&
+          !freshMetadata.location_state &&
+          !freshMetadata.location_country &&
+          !freshMetadata.location_country_code &&
+          !freshMetadata.location_name;
+
+        if (isVideoPath && missingGps && MediaProvider.isMediaIndexActive(this.config)) {
+          const retryCount = this._locationRetryCount.get(targetPath) || 0;
+          if (retryCount < 2) {
+            this._locationRetryCount.set(targetPath, retryCount + 1);
+            const delay = retryCount === 0 ? LOCATION_RETRY_DELAY_FIRST : LOCATION_RETRY_DELAY_SECOND;
+            // Cancel any existing timer for this specific path before scheduling a new one
+            clearTimeout(this._locationRetryTimers.get(targetPath));
+            const timer = setTimeout(async () => {
+              this._locationRetryTimers.delete(targetPath);
+              // Navigation guard: _clearLocationRetryTimers() cancels in-flight timers via
+              // clearTimeout on navigation, so this callback only fires for the current item.
+              // As an extra safety check, verify the path still matches the active media.
+              const stillActive = this._pendingMediaPath === targetPath ||
+                                  this._currentMediaPath === targetPath;
+              if (stillActive) {
+                this._log('\uD83D\uDD04 Retrying location metadata fetch for video:', targetPath);
+                await this._refreshMetadata();
+              }
+            }, delay);
+            this._locationRetryTimers.set(targetPath, timer);
+          }
+        }
       }
     } catch (error) {
       this._log('⚠️ Failed to refresh metadata:', error);
     }
   }
 
+  // Clear all pending location retry timers (called on navigation to prevent stale timers)
+  _clearLocationRetryTimers() {
+    for (const timer of this._locationRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._locationRetryTimers.clear();
+  }
+
   // V5.6.6: Check if file exists via provider (delegates to media_index service if available)
   async _checkFileExistsViaProvider(mediaItem) {
     // Validate mediaItem exists before proceeding
     if (!mediaItem) {
+      this._log('⚠️ File check skipped - no mediaItem');
       return null;
     }
     
     // Ask provider to check - MediaIndexProvider has service, others return null
     if (typeof this.provider?.checkFileExists === 'function') {
-      return await this.provider.checkFileExists(mediaItem);
+      try {
+        const result = await this.provider.checkFileExists(mediaItem);
+        this._log(`📁 Provider file check result: ${result}`);
+        return result;
+      } catch (err) {
+        this._log(`⚠️ Provider file check error: ${err.message}`);
+        return null;
+      }
     }
+    this._log('📁 Provider does not support file existence checks');
     return null; // Provider doesn't support file existence checks
   }
 
-  // V5.6: Helper to set mediaUrl with crossfade transition (validates first for images)
-  async _setMediaUrl(url, expectedNavigationIndex) {
-    // V5.7: Guard against stale async resolutions during rapid navigation
-    // If expectedNavigationIndex is provided and doesn't match current pending index, abort
+  _isHeicMedia(pathOrItem = this.currentMedia) {
+    const path = typeof pathOrItem === 'string'
+      ? pathOrItem
+      : (
+          pathOrItem?.media_content_id ||
+          pathOrItem?.media_source_uri ||
+          pathOrItem?.path ||
+          pathOrItem?.title ||
+          ''
+        );
+    const cleanPath = (path || '').split('?')[0].split('|')[0].toLowerCase();
+    return cleanPath.endsWith('.heic') || cleanPath.endsWith('.heif');
+  }
+
+  _isNavigationCurrent(expectedNavigationIndex, expectedGeneration) {
+    if (expectedGeneration !== undefined && expectedGeneration !== this._navigationGeneration) {
+      return false;
+    }
     if (expectedNavigationIndex !== undefined && this._pendingNavigationIndex !== expectedNavigationIndex) {
-      this._log(`⏭️ Skipping stale media resolution (expected: ${expectedNavigationIndex}, current: ${this._pendingNavigationIndex})`);
+      return false;
+    }
+    return true;
+  }
+
+  _cancelActiveMediaPrepare(reason = 'navigation') {
+    const active = this._activeMediaPrepare;
+    if (!active) return;
+
+    active.cancelled = true;
+    active.abortController?.abort?.();
+    if (active.element) {
+      try {
+        if (active.type === 'video') {
+          active.element.pause?.();
+          active.element.removeAttribute('src');
+          active.element.load?.();
+        } else {
+          active.element.src = '';
+        }
+      } catch (error) {
+        // Best-effort cleanup only; stale generation checks still protect the UI.
+      }
+    }
+    this._activeMediaPrepare = null;
+    this._log(`⏭️ Canceled media preparation (${reason})`);
+  }
+
+  _revokeHeicObjectUrls() {
+    if (!this._heicObjectUrlCache) return;
+
+    for (const objectUrl of this._heicObjectUrlCache.values()) {
+      URL.revokeObjectURL(objectUrl);
+    }
+
+    this._heicObjectUrlCache.clear();
+  }
+
+  _loadHeicConverter() {
+    if (window.heic2any) {
+      return Promise.resolve(window.heic2any);
+    }
+
+    if (this._heicConverterPromise) {
+      return this._heicConverterPromise;
+    }
+
+    const libraryUrl = this.config?.heic?.library_url ||
+      'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js';
+
+    this._heicConverterPromise = new Promise((resolve, reject) => {
+      const existingScript = document.querySelector(`script[data-ha-media-heic2any="${libraryUrl}"]`);
+      if (existingScript) {
+        existingScript.addEventListener('load', () => resolve(window.heic2any), { once: true });
+        existingScript.addEventListener('error', reject, { once: true });
+        return;
+      }
+
+      const script = document.createElement('script');
+      script.src = libraryUrl;
+      script.async = true;
+      script.dataset.haMediaHeic2any = libraryUrl;
+      script.onload = () => {
+        if (window.heic2any) {
+          resolve(window.heic2any);
+        } else {
+          reject(new Error('heic2any loaded without exposing window.heic2any'));
+        }
+      };
+      script.onerror = () => reject(new Error(`Failed to load HEIC converter: ${libraryUrl}`));
+      document.head.appendChild(script);
+    });
+
+    return this._heicConverterPromise;
+  }
+
+  async _prepareHeicDisplayUrl(url, expectedNavigationIndex, expectedGeneration) {
+    if (this.config?.heic?.enabled === false || (!this._isHeicMedia(this.currentMedia) && !this._isHeicMedia(url))) {
+      return url;
+    }
+
+    if (this._heicObjectUrlCache?.has(url)) {
+      return this._heicObjectUrlCache.get(url);
+    }
+
+    try {
+      this._log('🖼️ Converting HEIC image for browser display:', this.currentMedia?.media_content_id || url);
+      const converter = await this._loadHeicConverter();
+      if (!this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) return '';
+
+      const response = await fetch(url, { credentials: 'same-origin' });
+      if (!response.ok) {
+        throw new Error(`HEIC fetch failed with ${response.status}`);
+      }
+      if (!this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) return '';
+
+      const inputBlob = await response.blob();
+      const outputBlob = await converter({
+        blob: inputBlob,
+        toType: this.config?.heic?.output_type || 'image/jpeg',
+        quality: Number(this.config?.heic?.quality) || 0.92
+      });
+      const finalBlob = Array.isArray(outputBlob) ? outputBlob[0] : outputBlob;
+      const objectUrl = URL.createObjectURL(finalBlob);
+
+      if (!this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) {
+        URL.revokeObjectURL(objectUrl);
+        return '';
+      }
+
+      this._heicObjectUrlCache.set(url, objectUrl);
+      // Cap at 30 entries — each blob URL holds a decoded JPEG (3–8 MB).
+      // Maps iterate in insertion order so the first key is always the oldest.
+      if (this._heicObjectUrlCache.size > 30) {
+        const oldestUrl = this._heicObjectUrlCache.keys().next().value;
+        URL.revokeObjectURL(this._heicObjectUrlCache.get(oldestUrl));
+        this._heicObjectUrlCache.delete(oldestUrl);
+      }
+      return objectUrl;
+    } catch (error) {
+      console.warn('[MediaViewerCard] HEIC conversion failed, falling back to native image support:', error);
+      return url;
+    }
+  }
+
+  async _prepareMediaForDisplay(url, isVideo, expectedNavigationIndex, expectedGeneration) {
+    if (!url || this.config?.preload?.enabled === false) return true;
+    if (!this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) return false;
+    this._cancelActiveMediaPrepare('new media prepare');
+
+    if (isVideo) {
+      return this._preloadVideoForDisplay(url, expectedNavigationIndex, expectedGeneration);
+    }
+
+    return this._preloadImageForDisplay(url, expectedNavigationIndex, expectedGeneration);
+  }
+
+  async _preloadImageForDisplay(url, expectedNavigationIndex, expectedGeneration) {
+    const image = new Image();
+    const abortController = new AbortController();
+    const active = { type: 'image', element: image, abortController, generation: expectedGeneration, cancelled: false };
+    this._activeMediaPrepare = active;
+
+    try {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          image.onload = null;
+          image.onerror = null;
+          abortController.signal.removeEventListener('abort', onAbort);
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(new DOMException('Image preload aborted', 'AbortError'));
+        };
+        image.onload = () => {
+          cleanup();
+          resolve();
+        };
+        image.onerror = () => {
+          cleanup();
+          reject(new Error('Image preload failed'));
+        };
+        abortController.signal.addEventListener('abort', onAbort, { once: true });
+        image.decoding = 'async';
+        image.loading = 'eager';
+        image.src = url;
+      });
+
+      if (this.config?.preload?.image_decode !== false && typeof image.decode === 'function') {
+        await image.decode().catch(() => {});
+      }
+
+      return this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration);
+    } catch (error) {
+      if (error?.name === 'AbortError' || !this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) {
+        return false;
+      }
+      this._log('⚠️ Image preload failed; falling back to normal image load:', error.message || error);
+      return true;
+    } finally {
+      if (this._activeMediaPrepare === active) {
+        this._activeMediaPrepare = null;
+      }
+    }
+  }
+
+  async _preloadVideoForDisplay(url, expectedNavigationIndex, expectedGeneration) {
+    const mode = this.config?.preload?.video_mode || 'metadata';
+    if (mode === 'none') return true;
+
+    const video = document.createElement('video');
+    const abortController = new AbortController();
+    const active = { type: 'video', element: video, abortController, generation: expectedGeneration, cancelled: false };
+    const eventName = mode === 'canplay' ? 'canplay' : 'loadedmetadata';
+    const timeoutMs = Math.max(250, Number(this.config?.preload?.video_timeout_ms) || 3000);
+    this._activeMediaPrepare = active;
+
+    try {
+      await new Promise((resolve, reject) => {
+        let timeoutId = null;
+        const cleanup = () => {
+          clearTimeout(timeoutId);
+          video.onloadedmetadata = null;
+          video.oncanplay = null;
+          video.onerror = null;
+          abortController.signal.removeEventListener('abort', onAbort);
+        };
+        const onReady = () => {
+          cleanup();
+          resolve();
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(new DOMException('Video preload aborted', 'AbortError'));
+        };
+        timeoutId = setTimeout(() => {
+          cleanup();
+          resolve();
+        }, timeoutMs);
+        video[eventName === 'canplay' ? 'oncanplay' : 'onloadedmetadata'] = onReady;
+        video.onerror = () => {
+          cleanup();
+          resolve();
+        };
+        abortController.signal.addEventListener('abort', onAbort, { once: true });
+        video.preload = mode === 'canplay' ? 'auto' : 'metadata';
+        video.muted = true;
+        video.playsInline = true;
+        video.src = url;
+        video.load();
+      });
+
+      return this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration);
+    } catch (error) {
+      if (error?.name === 'AbortError' || !this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) {
+        return false;
+      }
+      return true;
+    } finally {
+      if (this._activeMediaPrepare === active) {
+        this._activeMediaPrepare = null;
+      }
+      try {
+        video.removeAttribute('src');
+        video.load();
+      } catch (error) {
+        // Best-effort cleanup.
+      }
+    }
+  }
+
+  // V5.6: Helper to set mediaUrl with crossfade transition (validates first for images)
+  async _setMediaUrl(url, expectedNavigationIndex, expectedGeneration = this._navigationGeneration) {
+    // V5.6.7: Guard against stale async resolutions during rapid navigation
+    // If expectedNavigationIndex is provided and doesn't match current pending index, abort
+    if (!this._isNavigationCurrent(expectedNavigationIndex, expectedGeneration)) {
+      this._log(`⏭️ Skipping stale media resolution (expected index: ${expectedNavigationIndex}, current index: ${this._pendingNavigationIndex}, expected generation: ${expectedGeneration}, current generation: ${this._navigationGeneration})`);
+      // Clear the navigation-in-progress flag when nothing else has claimed a pending
+      // path (i.e. no sync nav or newer _loadNext() is in flight). Without this,
+      // a stale return from a _loadNext() call that was superseded by a rapid sync
+      // burst can leave _navigatingAway=true permanently, causing the slideshow
+      // timer to log "Timer skipped" indefinitely.
+      if (!this._pendingMediaPath) this._navigatingAway = false;
       return;
     }
     
-    // Only use crossfade for images, not videos
-    const isVideo = this._isVideoFile(url);
+    // V5.6.7: Reset bottom overlay hiding when loading new media
+    // This ensures overlays are visible again for new content
+    if (this._hideBottomOverlaysForVideo) {
+      this._hideBottomOverlaysForVideo = false;
+    }
+    
+    // Only use crossfade for images, not videos.
+    // V5.8: Also check _isCurrentItemVideo() as a fallback for integration sources (Reolink,
+    // Immich, etc.) whose resolved URLs have no file extension.  Without this, _isVideoFile()
+    // returns false and _setMediaUrl takes the image crossfade path, which never calls
+    // videoElement.load().  Lit reuses the same <video> DOM node between navigations and the
+    // browser does NOT auto-reload when <source src> changes — so the video never plays.
+    // IMPORTANT: Pass `url` (the new URL) to _isCurrentItemVideo() so it checks the incoming
+    // URL rather than this.mediaUrl, which still holds the PREVIOUS item's URL at this point.
+    // Without this, a JPG following an mp4 is incorrectly classified as a video: both image
+    // layers get cleared, _renderMedia renders nothing, _onMediaLoaded never fires, and
+    // _navigatingAway stays true — freezing the slideshow timer permanently.
+    const isVideo = this._isVideoFile(url) || this._isCurrentItemVideo(url);
+    let displayUrl = url;
     
     // For images, validate they exist before displaying (MediaIndexProvider only)
     if (!isVideo) {
@@ -6178,9 +8710,18 @@ class MediaCard extends LitElement {
       }
       // If providerCheckResult is null, provider doesn't support checks (FolderProvider, SingleMediaProvider)
       // These providers discover files from disk, so 404s are unlikely - proceed without validation
+
+      displayUrl = await this._prepareHeicDisplayUrl(url, expectedNavigationIndex, expectedGeneration);
+      if (!displayUrl) {
+        return;
+      }
+    }
+
+    if (!await this._prepareMediaForDisplay(displayUrl, isVideo, expectedNavigationIndex, expectedGeneration)) {
+      return;
     }
     
-    this.mediaUrl = url;
+    this.mediaUrl = displayUrl;
     
     if (!isVideo) {
       const duration = this.config?.transition?.duration ?? 300;
@@ -6190,7 +8731,7 @@ class MediaCard extends LitElement {
         // Just update - render will show single image directly
         this.requestUpdate();
       } else {
-        // V5.7: Check again before setting layer URLs - navigation may have moved on during file check
+        // V5.6.7: Check again before setting layer URLs - navigation may have moved on during file check
         // Use navigationIndex (not _pendingNavigationIndex) since pending gets cleared when image loads
         const currentNavIndex = this._pendingNavigationIndex ?? this.navigationIndex;
         if (expectedNavigationIndex !== undefined && currentNavIndex !== expectedNavigationIndex) {
@@ -6199,11 +8740,11 @@ class MediaCard extends LitElement {
         }
         
         // Crossfade: set new image on hidden layer, then swap after it loads
-        // V5.7: If there's already a pending swap, clear both layers and start fresh
+        // V5.6.7: If there's already a pending swap, clear both layers and start fresh
         // This handles rapid navigation where the previous image hasn't loaded yet
         if (!this._frontLayerUrl && !this._backLayerUrl) {
           // Special case: Both layers empty (first load or after video), show immediately without crossfade
-          this._frontLayerUrl = url;
+          this._frontLayerUrl = displayUrl;
           this._frontLayerActive = true;
           this._pendingLayerSwap = false;
           this._frontLayerNavigationIndex = expectedNavigationIndex;
@@ -6211,7 +8752,7 @@ class MediaCard extends LitElement {
         } else if (this._pendingLayerSwap) {
           // Rapid navigation: Previous image hasn't loaded yet. Clear both and start fresh.
           this._log(`⏩ Rapid navigation detected - clearing both layers`);
-          this._frontLayerUrl = url;
+          this._frontLayerUrl = displayUrl;
           this._frontLayerGeneration++; // Invalidate any pending setTimeout for front layer
           this._backLayerUrl = '';
           this._backLayerGeneration++; // Invalidate any pending setTimeout for back layer
@@ -6223,11 +8764,11 @@ class MediaCard extends LitElement {
         } else {
           // Normal crossfade: load on hidden layer then swap
           if (this._frontLayerActive) {
-            this._backLayerUrl = url;
+            this._backLayerUrl = displayUrl;
             this._backLayerGeneration++; // Increment to invalidate any pending setTimeout for this layer
             this._backLayerNavigationIndex = expectedNavigationIndex;
           } else {
-            this._frontLayerUrl = url;
+            this._frontLayerUrl = displayUrl;
             this._frontLayerGeneration++; // Increment to invalidate any pending setTimeout for this layer
             this._frontLayerNavigationIndex = expectedNavigationIndex;
           }
@@ -6239,7 +8780,26 @@ class MediaCard extends LitElement {
         }
       }
     } else {
-      // For videos, just clear the image layers immediately
+      // V5.6.7: For videos, also check file existence before loading (prevents 404 errors getting stuck)
+      this._log('🎬 Checking video file existence before load...');
+      const providerCheckResult = await this._checkFileExistsViaProvider(this.currentMedia);
+      this._log(`🎬 Video file check result: ${providerCheckResult}`);
+      
+      if (providerCheckResult === false) {
+        // Service confirmed file doesn't exist - skip immediately
+        this._log('❌ Video file does not exist (filesystem check):', url);
+        this._log('⏭️ Skipping 404 video, removing from queues and advancing to next media');
+        this._remove404FromQueues(this.currentMedia);
+        setTimeout(() => this._loadNext(), 100);
+        return; // Don't set mediaUrl, abort display
+      } else if (providerCheckResult === true) {
+        this._log('✅ Video file exists (filesystem check):', url);
+      } else {
+        this._log('⚠️ Video file check unavailable (null) - proceeding with load');
+      }
+      // If null, provider doesn't support checks - proceed and let error handler deal with 404s
+      
+      // Clear the image layers immediately
       this._frontLayerUrl = '';
       this._backLayerUrl = '';
       this._frontLayerNavigationIndex = null; // Clear layer navigation indices
@@ -6254,6 +8814,19 @@ class MediaCard extends LitElement {
       this._log('🎬 Loading new video - reset tracking flags');
       
       this.requestUpdate();
+      
+      // V5.6.7: When going video → video, Lit reuses the same <video> element
+      // and just updates <source src>. But changing source doesn't auto-reload!
+      // We must explicitly call video.load() after render to trigger reload.
+      // NOTE: Copilot suggested checking readyState first, but that's wrong -
+      // readyState > 0 means the OLD video has data, not that the NEW source is loading.
+      // We MUST call load() to force browser to load the new source.
+      await this.updateComplete;
+      const videoElement = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+      if (videoElement) {
+        this._log('🎬 Explicitly reloading video element for video→video transition');
+        videoElement.load();
+      }
     }
   }
 
@@ -6265,8 +8838,9 @@ class MediaCard extends LitElement {
 
     const mediaId = this.currentMedia.media_content_id;
     
-    // V5.7: Capture pending index for async resolution guard
+    // V5.6.7: Capture pending index for async resolution guard
     const expectedIndex = this._pendingNavigationIndex;
+    const expectedGeneration = this._navigationGeneration;
     
     // Validate mediaId exists
     if (!mediaId) {
@@ -6277,7 +8851,7 @@ class MediaCard extends LitElement {
     
     // If already a full URL, use it
     if (mediaId.startsWith('http')) {
-      await this._setMediaUrl(mediaId, expectedIndex);
+      await this._setMediaUrl(mediaId, expectedIndex, expectedGeneration);
       this.requestUpdate();
       return;
     }
@@ -6285,92 +8859,104 @@ class MediaCard extends LitElement {
     // If media-source:// format, resolve through HA API
     if (mediaId.startsWith('media-source://')) {
       try {
-        // V5: Copy V4's approach - just pass through to HA without modification
-        const resolved = await this.hass.callWS({
-          type: "media_source/resolve_media",
-          media_content_id: mediaId,
-          expires: (60 * 60 * 3) // 3 hours
-        });
-        
-        // Add timestamp for auto-refresh (camera snapshots, etc.)
-        const finalUrl = this._addCacheBustingTimestamp(resolved.url);
-        
-        await this._setMediaUrl(finalUrl, expectedIndex);
-        this.requestUpdate();
-      } catch (error) {
-        console.error('[MediaCard] Failed to resolve media URL:', error);
-        await this._setMediaUrl('', expectedIndex);
-        this._nextMediaUrl = '';
-        this.requestUpdate();
-      }
-      return;
-    }
+        let resolvedUrl;
 
-    // Track recursion depth to prevent infinite loops
-    if (!this._validationDepth) this._validationDepth = 0;
-    const MAX_VALIDATION_ATTEMPTS = 10;
-    
-    // If /media/ path, convert to media-source:// and validate existence
-    if (mediaId.startsWith('/media/')) {
-      const mediaSourceId = 'media-source://media_source' + mediaId;
-      this._log('Converting /media/ to media-source://', mediaSourceId);
-      
-      try {
-        // Validate file exists by attempting to resolve it
-        const resolved = await this.hass.callWS({
-          type: "media_source/resolve_media",
-          media_content_id: mediaSourceId,
-          expires: (60 * 60 * 3)
-        });
-        this._log('✅ File exists and resolved to:', resolved.url);
-        this._validationDepth = 0; // Reset on success
-        await this._setMediaUrl(resolved.url, expectedIndex);
-        this.requestUpdate();
-        return; // Success - don't fall through to fallback
-      } catch (error) {
-        // File doesn't exist or can't be accessed - skip to next
-        console.warn('[MediaCard] File not found or inaccessible, skipping to next:', mediaId, error.message);
-        
-        // Track file as missing to avoid re-querying from media_index
-        if (this.provider?.mediaIndexProvider) {
-          this.provider.mediaIndexProvider.excludedFiles.add(mediaId);
-          this._log('Added to excluded files set:', mediaId);
+        // When disable_cache_busting is on, reuse the authSig URL from _thumbnailUrlCache
+        // so the browser can cache the image bytes between navigation visits.
+        // On normal mode we always re-resolve so a fresh authSig (and optional timestamp) is used.
+        if (this.config?.disable_cache_busting) {
+          const cached = this._thumbnailUrlCache?.get(mediaId);
+          if (cached && Date.now() < cached.expiresAt) {
+            resolvedUrl = cached.url;
+            this._log('🔗 Reusing cached authSig URL for', mediaId);
+          }
         }
-        
-        // Remove the bad item from history at the current position
-        if (this.history.length > 0) {
-          const idx = this.historyIndex === -1 ? this.history.length - 1 : this.historyIndex;
-          if (this.history[idx]?.media_content_id === mediaId) {
-            this._log('Removing invalid item from history at index', idx);
-            this.history.splice(idx, 1);
-            // Adjust historyIndex if needed
-            if (this.historyIndex > idx || this.historyIndex === this.history.length) {
-              this.historyIndex = this.history.length - 1;
+
+        if (!resolvedUrl) {
+          // V5: Copy V4's approach - just pass through to HA without modification
+          const resolved = await this.hass.callWS({
+            type: "media_source/resolve_media",
+            media_content_id: mediaId,
+            expires: (60 * 60 * 3) // 3 hours
+          });
+          resolvedUrl = resolved.url;
+
+          // Cache for reuse when disable_cache_busting is enabled.
+          if (this._thumbnailUrlCache) {
+            const expiresAt = resolved.expires
+              ? resolved.expires * 1000
+              : Date.now() + 3 * 3600 * 1000;
+            this._thumbnailUrlCache.set(mediaId, { url: resolvedUrl, expiresAt });
+            if (this._thumbnailUrlCache.size > 2000) {
+              this._thumbnailUrlCache.delete(this._thumbnailUrlCache.keys().next().value);
             }
           }
         }
         
-        // Clear the current media to avoid showing broken state
-        await this._setMediaUrl('', expectedIndex);
+        // Add timestamp for auto-refresh (camera snapshots, etc.)
+        const finalUrl = this._addCacheBustingTimestamp(resolvedUrl);
         
-        // Check recursion depth before recursive call
-        this._validationDepth = (this._validationDepth || 0) + 1;
-        if (this._validationDepth >= MAX_VALIDATION_ATTEMPTS) {
-          console.error('[MediaCard] Too many consecutive missing files, stopping validation');
-          this._validationDepth = 0;
-          return;
-        }
-        
-        // Recursively skip to next item without adding to history
-        this._log('⏭️ Skipping to next item due to missing file (depth:', this._validationDepth, ')');
-        await this.next(); // Get next item (will validate recursively)
-        return;
+        await this._setMediaUrl(finalUrl, expectedIndex, expectedGeneration);
+        this.requestUpdate();
+      } catch (error) {
+        console.error('[MediaViewerCard] Failed to resolve media URL:', mediaId, error);
+        // Remove from all queues so it can never be landed on again (forward OR backward).
+        // _remove404FromQueues adjusts navigationIndex if the removed item was before the
+        // current position, keeping forward/backward navigation correct.
+        // Also exclude from provider so it won't be re-queued on the next provider fetch.
+        this._remove404FromQueues(this.currentMedia);
+        setTimeout(() => this._loadNext(), 100);
       }
+      return;
+    }
+
+    // If /media/ path, convert to media-source:// and resolve (auth token required)
+    if (mediaId.startsWith('/media/')) {
+      const mediaSourceId = 'media-source://media_source' + mediaId;
+      this._log('Converting /media/ to media-source://', mediaSourceId);
+      try {
+        let resolvedUrl;
+
+        if (this.config?.disable_cache_busting) {
+          const cached = this._thumbnailUrlCache?.get(mediaSourceId);
+          if (cached && Date.now() < cached.expiresAt) {
+            resolvedUrl = cached.url;
+            this._log('🔗 Reusing cached authSig URL for', mediaSourceId);
+          }
+        }
+
+        if (!resolvedUrl) {
+          const resolved = await this.hass.callWS({
+            type: "media_source/resolve_media",
+            media_content_id: mediaSourceId,
+            expires: (60 * 60 * 3)
+          });
+          resolvedUrl = resolved.url;
+
+          if (this._thumbnailUrlCache) {
+            const expiresAt = resolved.expires
+              ? resolved.expires * 1000
+              : Date.now() + 3 * 3600 * 1000;
+            this._thumbnailUrlCache.set(mediaSourceId, { url: resolvedUrl, expiresAt });
+            if (this._thumbnailUrlCache.size > 2000) {
+              this._thumbnailUrlCache.delete(this._thumbnailUrlCache.keys().next().value);
+            }
+          }
+        }
+
+        await this._setMediaUrl(resolvedUrl, expectedIndex, expectedGeneration);
+        this.requestUpdate();
+      } catch (error) {
+        console.warn('[MediaViewerCard] Failed to resolve /media/ path, skipping:', mediaId, error.message);
+        this._remove404FromQueues(this.currentMedia);
+        setTimeout(() => this._loadNext(), 100);
+      }
+      return;
     }
 
     // Fallback: use as-is
     this._log('Using media ID as-is (fallback)');
-    await this._setMediaUrl(mediaId, expectedIndex);
+    await this._setMediaUrl(mediaId, expectedIndex, expectedGeneration);
     this.requestUpdate();
   }
 
@@ -6399,7 +8985,7 @@ class MediaCard extends LitElement {
         });
         return resolved.url;
       } catch (error) {
-        console.error('[MediaCard] Failed to resolve media path:', mediaPath, error);
+        console.error('[MediaViewerCard] Failed to resolve media path:', mediaPath, error);
         return '';
       }
     }
@@ -6409,8 +8995,32 @@ class MediaCard extends LitElement {
   }
   
   _onMediaError(e) {
+    const target = e?.target;
+    if (this._livePhotoPhase === 'video' && target?.classList?.contains('live-photo-video')) {
+      this._onLivePhotoVideoError(e);
+      return;
+    }
+
+    // V5.6.7: Clear navigation flag to prevent slideshow getting stuck on 404 errors
+    this._navigatingAway = false;
+
+    // If the failing image was the hidden pending layer, reset _pendingLayerSwap so the
+    // next navigation gets a proper crossfade instead of being treated as "rapid navigation".
+    if (this._pendingLayerSwap && target?.classList?.contains('image-layer') && target.classList.contains('inactive')) {
+      this._log('🧹 [XFADE] Clearing stale _pendingLayerSwap from failed hidden-layer load — next transition will crossfade normally');
+      this._pendingLayerSwap = false;
+      if (this._frontLayerActive) {
+        // Front is active → back was the hidden pending layer
+        this._backLayerUrl = '';
+        this._backLayerNavigationIndex = null;
+      } else {
+        // Back is active → front was the hidden pending layer
+        this._frontLayerUrl = '';
+        this._frontLayerNavigationIndex = null;
+      }
+    }
+    
     // V4 comprehensive error handling
-    const target = e.target;
     const error = target?.error;
     
     let errorMessage = 'Media file not found';
@@ -6419,7 +9029,7 @@ class MediaCard extends LitElement {
     // Handle case where target is null (element destroyed/replaced)
     if (!target) {
       errorMessage = 'Media element unavailable';
-      console.warn('[MediaCard] Media error event has null target - element may have been destroyed');
+      console.warn('[MediaViewerCard] Media error event has null target - element may have been destroyed');
     } else if (error) {
       switch (error.code) {
         case error.MEDIA_ERR_ABORTED:
@@ -6441,7 +9051,7 @@ class MediaCard extends LitElement {
     
     // Only log errors that aren't 404s - 404s are expected when database is out of sync
     if (!is404 && this._debugMode) {
-      console.error('[MediaCard] Media failed to load:', this.mediaUrl, e);
+      console.error('[MediaViewerCard] Media failed to load:', this.mediaUrl, e);
     } else {
       this._log('📭 Media file not found (404) - likely deleted/moved:', this.mediaUrl);
     }
@@ -6450,7 +9060,7 @@ class MediaCard extends LitElement {
     const isSynologyUrl = this.mediaUrl && this.mediaUrl.includes('/synology_dsm/') && this.mediaUrl.includes('authSig=');
     if (isSynologyUrl) {
       errorMessage = 'Synology DSM authentication expired - try refreshing';
-      console.warn('[MediaCard] Synology DSM URL authentication may have expired:', this.mediaUrl);
+      console.warn('[MediaViewerCard] Synology DSM URL authentication may have expired:', this.mediaUrl);
     }
     
     // Apply pending metadata even on error to avoid stale metadata from previous media
@@ -6491,16 +9101,26 @@ class MediaCard extends LitElement {
             }
           })
           .catch(err => {
-            console.error('[MediaCard] URL refresh attempt failed:', err);
+            console.error('[MediaViewerCard] URL refresh attempt failed:', err);
             this._showMediaError(errorMessage, isSynologyUrl);
           });
       } else {
         // For folder/queue modes, if it's a 404, remove from queue and skip to next automatically
         if (is404) {
-          this._log('⏭️ Skipping 404 file, removing from queues and advancing to next media');
-          // Remove from navigation queue and panel queue to prevent showing again
-          this._remove404FromQueues(this.currentMedia);
-          // Skip to next without showing error
+          // V5.8: For video items, use transient-failure threshold before permanently removing.
+          // MEDIA_ERR_SRC_NOT_SUPPORTED fires for ANY HTTP error (400, 403, 404, 500) not just 404.
+          // Reolink's NVR can return 400 when rejecting concurrent download requests.
+          if (this._isCurrentItemVideo()) {
+            this._handleVideoFolderFailure();
+          } else {
+            this._log('⏭️ Skipping 404 file, removing from queues and advancing to next media');
+            this._remove404FromQueues(this.currentMedia);
+            setTimeout(() => this._loadNext(), 100);
+          }
+        } else if (error?.code === 3 /* MEDIA_ERR_DECODE */ && this.config.media_source_type !== 'single_media') {
+          // Corrupt or partially unplayable file - browser decoder gave up.
+          // Silently skip rather than entering error state (which would loop via hass auto-recovery).
+          this._log('⏭️ Video decode error (corrupt/unsupported format) - skipping to next media');
           setTimeout(() => this._loadNext(), 100);
         } else {
           this._showMediaError(errorMessage, isSynologyUrl);
@@ -6510,8 +9130,17 @@ class MediaCard extends LitElement {
       // Already tried to retry this URL
       if (is404 && this.config.media_source_type !== 'single_media') {
         // For 404s in folder/queue mode, remove from queue and skip to next instead of showing error
-        this._log('⏭️ Skipping 404 file after retry, removing from queues and advancing to next media');
-        this._remove404FromQueues(this.currentMedia);
+        // V5.8: Apply transient-failure threshold for video items (same rationale as Path A above)
+        if (this._isCurrentItemVideo()) {
+          this._handleVideoFolderFailure();
+        } else {
+          this._log('⏭️ Skipping 404 file after retry, removing from queues and advancing to next media');
+          this._remove404FromQueues(this.currentMedia);
+          setTimeout(() => this._loadNext(), 100);
+        }
+      } else if (error?.code === 3 /* MEDIA_ERR_DECODE */ && this.config.media_source_type !== 'single_media') {
+        // Decode error on retry - still a corrupt/unsupported file, skip silently.
+        this._log('⏭️ Video decode error after retry (corrupt/unsupported format) - skipping to next media');
         setTimeout(() => this._loadNext(), 100);
       } else {
         // Show error for non-404 errors or single media mode
@@ -6521,13 +9150,40 @@ class MediaCard extends LitElement {
     }
   }
   
+  // V5.6.7: Handle errors from <source> elements inside <video>
+  // Source element errors don't bubble to the video element, so we need to handle them separately
+  _onSourceError(e) {
+    const sourceElement = e.target;
+    const videoElement = sourceElement?.parentElement;
+    
+    this._log('🎬 Source element error:', sourceElement?.src);
+    
+    // Check if this is the last source that failed (video networkState becomes NETWORK_NO_SOURCE)
+    // networkState 3 = NETWORK_NO_SOURCE (all sources failed)
+    if (videoElement && videoElement.networkState === 3) {
+      // Guard against duplicate handling - check if we're already processing this error
+      if (this._sourceErrorHandled) {
+        this._log('🎬 Source error already handled, skipping duplicate');
+        return;
+      }
+      this._sourceErrorHandled = true;
+      
+      this._log('🎬 All video sources failed - treating as 404');
+      // Simulate a media error event to trigger the same handling
+      this._onMediaError({ target: videoElement });
+      
+      // Reset flag after a short delay to allow handling new videos
+      setTimeout(() => { this._sourceErrorHandled = false; }, 100);
+    }
+  }
+  
   async _attemptUrlRefresh(forceRefresh = false) {
     this._log('🔄 Attempting URL refresh due to media load failure');
     
     // V4: Log additional context for Synology DSM URLs
     if (this.mediaUrl && this.mediaUrl.includes('/synology_dsm/')) {
       this._log('🔄 Synology DSM URL detected - checking authentication signature');
-      console.warn('[MediaCard] Synology DSM URL refresh needed:', this.mediaUrl.substring(0, 100) + '...');
+      console.warn('[MediaViewerCard] Synology DSM URL refresh needed:', this.mediaUrl.substring(0, 100) + '...');
     }
     
     try {
@@ -6584,11 +9240,11 @@ class MediaCard extends LitElement {
         }
       }
       
-      console.warn('[MediaCard] ⚠️ All URL refresh attempts failed or returned same URL');
+      console.warn('[MediaViewerCard] ⚠️ All URL refresh attempts failed or returned same URL');
       return false;
       
     } catch (error) {
-      console.error('[MediaCard] ❌ URL refresh failed:', error);
+      console.error('[MediaViewerCard] ❌ URL refresh failed:', error);
       return false;
     }
   }
@@ -6635,7 +9291,15 @@ class MediaCard extends LitElement {
       this._log('🔇 Skipping 404 error UI - will auto-advance silently');
       
       // V5: Remove from queues to prevent showing again
+      // V5.8: For video items, apply transient-failure threshold before permanent removal.
+      // MEDIA_ERR_SRC_NOT_SUPPORTED fires for ANY HTTP error (400, 403, 404, 500) – Reolink's NVR
+      // can return 400 when it rejects concurrent download requests.  Allow one transient skip
+      // before permanently removing.  _handleVideoFolderFailure() also calls _loadNext().
       if (this.currentMedia) {
+        if (this._isCurrentItemVideo()) {
+          this._handleVideoFolderFailure();
+          return; // _handleVideoFolderFailure handles advancing
+        }
         this._log(`🗑️ File not found (404) - removing from queue: ${currentPath}`);
         this._remove404FromQueues(this.currentMedia);
       }
@@ -6669,7 +9333,7 @@ class MediaCard extends LitElement {
     
     // V4: For non-404 errors, or 404s in single media mode, store error state and show UI
     if (this._debugMode) {
-      console.error('[MediaCard] Showing media error:', errorMessage);
+      console.error('[MediaViewerCard] Showing media error:', errorMessage);
     }
     this._errorState = {
       message: errorMessage,
@@ -6689,6 +9353,391 @@ class MediaCard extends LitElement {
     }
   }
 
+  // V5.11: Live Photo helpers
+  _isLivePhotoEnabled() {
+    return this.config?.live_photo?.enabled === true;
+  }
+
+  _clearLivePhotoTimer() {
+    if (this._livePhotoTimer) {
+      clearTimeout(this._livePhotoTimer);
+      this._livePhotoTimer = null;
+    }
+  }
+
+  _clearLivePhotoPlayback() {
+    this._clearLivePhotoTimer();
+    this._livePhotoGeneration++;
+    this._livePhotoPhase = 'idle';
+    this._livePhotoVideoUrl = '';
+    this._livePhotoVideoReady = false;
+  }
+
+  _getLivePhotoItemId(item = this.currentMedia) {
+    return item?.media_content_id || item?.media_source_uri || item?.path || item?.metadata?.path || '';
+  }
+
+  _getLivePhotoFileName(itemOrPath) {
+    const path = typeof itemOrPath === 'string' ? itemOrPath : this._getLivePhotoItemId(itemOrPath);
+    const cleanPath = (path || '').split('?')[0].split('|')[0];
+    return cleanPath.split('/').pop() || cleanPath;
+  }
+
+  _getLivePhotoBaseName(itemOrPath) {
+    const filename = this._getLivePhotoFileName(itemOrPath);
+    const dotIndex = filename.lastIndexOf('.');
+    return dotIndex > 0 ? filename.substring(0, dotIndex) : filename;
+  }
+
+  _isImageItem(item) {
+    if (!item) return false;
+    if (item.media_content_type?.startsWith('image')) return true;
+    return MediaUtils.detectFileType(this._getLivePhotoItemId(item)) === 'image' ||
+           MediaUtils.detectFileType(item.title || '') === 'image';
+  }
+
+  _buildLivePhotoStillCandidatesForVideo(item) {
+    const mediaId = this._getLivePhotoItemId(item);
+    if (!mediaId) return [];
+
+    const cleanId = mediaId.split('?')[0];
+    const slashIndex = cleanId.lastIndexOf('/');
+    const dotIndex = cleanId.lastIndexOf('.');
+    if (dotIndex <= slashIndex) return [];
+
+    const basePath = cleanId.substring(0, dotIndex);
+    const basePaths = new Set([basePath]);
+    const suffixes = this.config?.live_photo?.video_suffixes || ['_HEVC', '-HEVC', ''];
+    for (const suffix of suffixes) {
+      if (suffix && basePath.toLowerCase().endsWith(String(suffix).toLowerCase())) {
+        basePaths.add(basePath.substring(0, basePath.length - String(suffix).length));
+      }
+    }
+
+    const stillExtensions = this.config?.live_photo?.still_extensions ||
+      ['JPG', 'jpg', 'JPEG', 'jpeg', 'PNG', 'png', 'WEBP', 'webp'];
+    const candidates = [];
+    const seen = new Set();
+    for (const stillBasePath of basePaths) {
+      for (const extension of stillExtensions) {
+        const candidate = `${stillBasePath}.${extension}`;
+        if (!seen.has(candidate)) {
+          candidates.push(candidate);
+          seen.add(candidate);
+        }
+      }
+    }
+    return candidates;
+  }
+
+  async _hasLivePhotoStillForVideo(item) {
+    const itemId = this._getLivePhotoItemId(item);
+    if (!itemId || !this.hass) return false;
+
+    const cached = this._livePhotoCompanionVideoCache.get(itemId);
+    if (cached === true) {
+      return true;
+    }
+    if (cached && cached.value === false) {
+      if (Date.now() - cached.checkedAt < this._livePhotoNegativeCacheMs) {
+        return false;
+      }
+      this._livePhotoCompanionVideoCache.delete(itemId);
+    } else if (cached === false) {
+      return false;
+    }
+
+    const candidates = this._buildLivePhotoStillCandidatesForVideo(item);
+    if (!candidates.length) {
+      this._livePhotoCompanionVideoCache.set(itemId, { value: false, checkedAt: Date.now() });
+      return false;
+    }
+
+    for (const candidate of candidates) {
+      const mediaContentId = candidate.startsWith('/media/')
+        ? `media-source://media_source${candidate}`
+        : candidate;
+      try {
+        await this.hass.callWS({
+          type: 'media_source/resolve_media',
+          media_content_id: mediaContentId,
+          expires: 60
+        });
+        this._livePhotoCompanionVideoCache.set(itemId, true);
+        // Cap positive entries at 200 — they are never evicted by the TTL path.
+        if (this._livePhotoCompanionVideoCache.size > 200) {
+          this._livePhotoCompanionVideoCache.delete(
+            this._livePhotoCompanionVideoCache.keys().next().value
+          );
+        }
+        this._log('🎞️ Live Photo still found for companion video:', mediaContentId);
+        return true;
+      } catch (error) {
+        // Candidate does not exist or is not resolvable; try the next still extension.
+      }
+    }
+
+    this._livePhotoCompanionVideoCache.set(itemId, { value: false, checkedAt: Date.now() });
+    return false;
+  }
+
+  async _shouldHideLivePhotoCompanionVideo(item) {
+    if (!this._isLivePhotoEnabled() || this.config?.live_photo?.hide_companion_videos === false) {
+      return false;
+    }
+    if (!this._isVideoItem(item)) return false;
+
+    const baseName = this._getLivePhotoBaseName(item).toLowerCase();
+    const suffixes = this.config?.live_photo?.video_suffixes || ['_HEVC', '-HEVC'];
+    const hasCompanionSuffix = suffixes
+      .filter(suffix => suffix && String(suffix).length > 0)
+      .some(suffix => baseName.endsWith(String(suffix).toLowerCase()));
+    if (hasCompanionSuffix) return true;
+
+    // Only probe for a matching still if this is a .mov file.
+    // Live Photo companions from iPhone are always .mov — regular .mp4 files
+    // that happen to share a base name with a .jpg are NOT Live Photo companions.
+    const itemId = this._getLivePhotoItemId(item);
+    const ext = itemId.split('?')[0].split('.').pop().toLowerCase();
+    if (ext !== 'mov') return false;
+
+    return await this._hasLivePhotoStillForVideo(item);
+  }
+
+  _removeItemFromQueues(item) {
+    if (!item) return;
+    const itemId = item.media_content_id || item.media_source_uri || item.path;
+    const matches = (candidate) => {
+      const candidateId = candidate?.media_content_id || candidate?.media_source_uri || candidate?.path;
+      return candidate === item || (!!itemId && candidateId === itemId);
+    };
+
+    this.navigationQueue = (this.navigationQueue || []).filter(candidate => !matches(candidate));
+    this.history = (this.history || []).filter(candidate => !matches(candidate));
+    if (this._panelQueue?.length) {
+      this._panelQueue = this._panelQueue.filter(candidate => !matches(candidate));
+    }
+    if (this.provider?.queue?.length) {
+      this.provider.queue = this.provider.queue.filter(candidate => !matches(candidate));
+    }
+  }
+
+  _buildLivePhotoCompanionCandidates(item = this.currentMedia) {
+    const mediaId = this._getLivePhotoItemId(item);
+    if (!mediaId) return [];
+
+    const cleanId = mediaId.split('?')[0];
+    const slashIndex = cleanId.lastIndexOf('/');
+    const dotIndex = cleanId.lastIndexOf('.');
+    if (dotIndex <= slashIndex) return [];
+
+    const basePath = cleanId.substring(0, dotIndex);
+    const suffixes = this.config?.live_photo?.video_suffixes || ['_HEVC', '-HEVC', ''];
+    const extensions = this.config?.live_photo?.video_extensions || ['MOV', 'mov', 'mp4', 'MP4'];
+    const candidates = [];
+    const seen = new Set();
+
+    for (const suffix of suffixes) {
+      for (const extension of extensions) {
+        const candidate = `${basePath}${suffix || ''}.${extension}`;
+        if (!seen.has(candidate)) {
+          candidates.push(candidate);
+          seen.add(candidate);
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  async _resolveLivePhotoCompanion(item = this.currentMedia) {
+    const itemId = this._getLivePhotoItemId(item);
+    if (!itemId || !this.hass) return null;
+
+    if (this._livePhotoCompanionCache.get(itemId)) {
+      return this._livePhotoCompanionCache.get(itemId);
+    }
+
+    for (const candidate of this._buildLivePhotoCompanionCandidates(item)) {
+      const mediaContentId = candidate.startsWith('/media/')
+        ? `media-source://media_source${candidate}`
+        : candidate;
+
+      try {
+        const resolved = await this.hass.callWS({
+          type: 'media_source/resolve_media',
+          media_content_id: mediaContentId,
+          expires: (60 * 60 * 3)
+        });
+        const url = this._addCacheBustingTimestamp(resolved.url);
+        const companion = { media_content_id: mediaContentId, url };
+        this._livePhotoCompanionCache.set(itemId, companion);
+        this._log('🎞️ Live Photo companion resolved:', mediaContentId);
+        return companion;
+      } catch (error) {
+        this._log('🎞️ Live Photo companion candidate not available:', mediaContentId);
+      }
+    }
+
+    return null;
+  }
+
+  _scheduleLivePhotoPlayback() {
+    this._clearLivePhotoTimer();
+
+    if (!this._isLivePhotoEnabled() ||
+        this._livePhotoPhase === 'pause' ||
+        this._livePhotoPhase === 'video' ||
+        !this._isImageItem(this.currentMedia) ||
+        this._isPaused ||
+        this._backgroundPaused ||
+        !this.mediaUrl) {
+      return;
+    }
+
+    const generation = ++this._livePhotoGeneration;
+    const itemId = this._getLivePhotoItemId(this.currentMedia);
+    this._livePhotoPhase = 'still';
+    const stillMs = Math.max(0.1, Number(this.config.live_photo?.still_duration) || 1) * 1000;
+
+    this._warmLivePhotoCompanion(generation, itemId);
+
+    this._livePhotoTimer = setTimeout(() => {
+      this._startLivePhotoVideo(generation, itemId);
+    }, stillMs);
+  }
+
+  async _warmLivePhotoCompanion(generation, itemId) {
+    try {
+      const companion = await this._resolveLivePhotoCompanion(this.currentMedia);
+      if (!companion ||
+          generation !== this._livePhotoGeneration ||
+          itemId !== this._getLivePhotoItemId(this.currentMedia) ||
+          this.config?.live_photo?.preload_video === false) {
+        return;
+      }
+      await this._preloadLivePhotoVideo(companion.url, generation, itemId);
+    } catch (error) {
+      this._log('🎞️ Live Photo warmup skipped:', error?.message || error);
+    }
+  }
+
+  async _preloadLivePhotoVideo(url, generation, itemId) {
+    if (!url || typeof document === 'undefined') return;
+
+    await new Promise(resolve => {
+      const video = document.createElement('video');
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        video.removeEventListener('loadedmetadata', onReady);
+        video.removeEventListener('canplay', onReady);
+        video.removeEventListener('error', onDone);
+        video.removeAttribute('src');
+        video.load?.();
+        resolve();
+      };
+      const isCurrent = () =>
+        generation === this._livePhotoGeneration &&
+        itemId === this._getLivePhotoItemId(this.currentMedia);
+      const onReady = () => cleanup();
+      const onDone = () => cleanup();
+      const timeout = setTimeout(cleanup, 3000);
+
+      if (!isCurrent()) {
+        cleanup();
+        return;
+      }
+
+      video.preload = 'auto';
+      video.muted = true;
+      video.playsInline = true;
+      video.addEventListener('loadedmetadata', onReady, { once: true });
+      video.addEventListener('canplay', onReady, { once: true });
+      video.addEventListener('error', onDone, { once: true });
+      video.src = url;
+      video.load();
+    });
+  }
+
+  async _startLivePhotoVideo(generation, itemId) {
+    if (generation !== this._livePhotoGeneration ||
+        itemId !== this._getLivePhotoItemId(this.currentMedia) ||
+        this._isPaused ||
+        this._backgroundPaused) {
+      return;
+    }
+
+    const companion = await this._resolveLivePhotoCompanion(this.currentMedia);
+    if (!companion ||
+        generation !== this._livePhotoGeneration ||
+        itemId !== this._getLivePhotoItemId(this.currentMedia)) {
+      this._livePhotoPhase = 'idle';
+      return;
+    }
+
+    this._livePhotoVideoUrl = companion.url;
+    this._livePhotoVideoReady = false;
+    this._livePhotoPhase = 'video';
+    this.requestUpdate();
+  }
+
+  _getLivePhotoRepeatDelaySeconds() {
+    const repeatDelay = this.config.live_photo?.repeat_delay;
+    if (repeatDelay !== undefined && repeatDelay !== null) {
+      return Math.max(0, Number(repeatDelay) || 0);
+    }
+    return Math.max(0, Number(this.config.live_photo?.pause_duration) || 10);
+  }
+
+  _onLivePhotoVideoCanPlay(e) {
+    if (this._livePhotoPhase !== 'video') return;
+    this._livePhotoVideoReady = true;
+    const video = e?.target;
+    if (video && video.paused) {
+      video.play().catch(error => {
+        if (error?.name !== 'AbortError') {
+          this._log('🎞️ Live Photo autoplay failed:', error);
+        }
+      });
+    }
+    this.requestUpdate();
+  }
+
+  _onLivePhotoVideoError() {
+    if (this._livePhotoPhase !== 'video') return;
+    const itemId = this._getLivePhotoItemId(this.currentMedia);
+    if (itemId) this._livePhotoCompanionCache.delete(itemId);
+    this._livePhotoPhase = 'still';
+    this._livePhotoVideoUrl = '';
+    this._livePhotoVideoReady = false;
+    this._log('🎞️ Live Photo companion video failed - keeping still image visible');
+    this.requestUpdate();
+  }
+
+  _onLivePhotoVideoEnded(e) {
+    e?.stopPropagation?.();
+    if (this._livePhotoPhase !== 'video') return false;
+
+    this._clearLivePhotoTimer();
+    const generation = ++this._livePhotoGeneration;
+    const itemId = this._getLivePhotoItemId(this.currentMedia);
+    const pauseMs = this._getLivePhotoRepeatDelaySeconds() * 1000;
+
+    this._livePhotoPhase = 'pause';
+    this._livePhotoVideoUrl = '';
+    this._livePhotoVideoReady = false;
+    this._hideBottomOverlaysForVideo = false;
+    this.requestUpdate();
+
+    this._livePhotoTimer = setTimeout(() => {
+      this._startLivePhotoVideo(generation, itemId);
+    }, pauseMs);
+    return true;
+  }
+
   // V4: Video event handlers
   _onVideoLoadStart() {
     this._log('Video load initiated:', this.mediaUrl);
@@ -6696,11 +9745,61 @@ class MediaCard extends LitElement {
     this._videoWaitStartTime = null;
     // Reset user interaction flag for new video
     this._videoUserInteracted = false;
+    // V5.8: If the user has an active unmute preference (they explicitly chose to unmute),
+    // treat each new video as "interacted" so it plays to completion without being cut off
+    // by max_video_duration. Uses _isUserMutePreferenceValid() + _userMutePreference===false
+    // rather than _getEffectiveMuteState() so that the default video_muted:false config
+    // setting does NOT trigger this path - only an explicit user action does.
+    if (this._isUserMutePreferenceValid() && this._userMutePreference === false) {
+      this._videoUserInteracted = true;
+      this._log('🎬 Active unmute preference - treating new video as interacted (plays to end, ignores max_video_duration)');
+      // If this card is a follower, claim driver early (before canplay) so the original
+      // driver's canplay write doesn't arrive with isDriverCard:true and re-establish
+      // our follower state. Writing sync now claims the role on all same-device cards;
+      // the canplay write will follow with the confirmed metadata.
+      if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+        this._claimDriverRole();
+        this._writeSharedQueueState();
+      }
+    }
+    // V5.6.8: Reset video controls visibility and overlay state for new video
+    this._videoControlsVisible = false;
+    this._hideBottomOverlaysForVideo = false;
   }
 
   _onVideoCanPlay() {
+    // _suppressCastPushOnCanplay is set when _startCastSync resumes via v.play() or
+    // when _seekVideo changes currentTime.  These are not genuine "new video ready"
+    // events — all pending state has already been applied on the real canplay.
+    // Return immediately to avoid clearing _navigatingAway (which would unblock the
+    // slideshow timer while a forward-navigation is still in flight) and to avoid a
+    // spurious _writeSharedQueueState broadcast that triggers a navigation loop.
+    //
+    // IMPORTANT: only honour the suppress flag when we are NOT navigating.
+    // If _navigatingAway is true, we are on a NEW video and the suppress flag is
+    // stale — left over from the previous video's _startCastSync startup poller
+    // (which sets suppress then calls v.play(); if no seek occurred, no canplay
+    // fired to clear it, so it persists into the next video's canplay).
+    // In that case we must fall through so _navigatingAway is cleared and the
+    // new video is pushed to Roku.
+    if (this._suppressCastPushOnCanplay && !this._navigatingAway) {
+      this._suppressCastPushOnCanplay = false;
+      return;
+    }
+    this._suppressCastPushOnCanplay = false; // always clear on any real canplay
+
     // V5.6.4: Timer uses simple counter, no timestamp needed
     this._log('🎬 Video ready - can play');
+    // Clear the manual-nav load-phase flag now that the media has committed to the DOM.
+    this._manualNavLoading = false;
+    
+    // V5.8: Clear transient failure counter – video loaded successfully this time
+    const itemId = this.currentMedia?.media_content_id;
+    if (itemId) this._videoTransientFailures.delete(itemId);
+    
+    // V5.6.7: Clear navigation flag now that video is actually ready to play
+    // This prevents timer from firing prematurely during video-to-video transitions
+    this._navigatingAway = false;
     
     // V5: Apply pending metadata AND navigation index when video is ready
     if (this._pendingMetadata !== null) {
@@ -6717,7 +9816,36 @@ class MediaCard extends LitElement {
       this._currentMediaPath = this._pendingMediaPath;
       this._pendingMediaPath = null;
     }
-    
+
+    // If group-paused (cast group-pause sync arrived before or combined with navigation),
+    // immediately re-pause the new video. This handles manual navigation where
+    // _claimDriverRole() in _startCastSync() cancels the navigation-only HA write,
+    // causing followers to receive a single combined sync with both navigation and
+    // group-pause — the video autoplay attribute plays it when ready, so we pause here.
+    if (this._groupPaused) {
+      const video = this.renderRoot?.querySelector('video:not(.live-photo-video)');
+      if (video && !video.paused) {
+        this._castSyncPausing = true; // suppress _onVideoPause side-effects
+        video.pause();
+      }
+      this.requestUpdate();
+      return;
+    }
+
+    // Shared queue: broadcast navigation — suppress if locally paused (short press)
+    // or if currently in cross-device follower mode.  If a follower writes sync here
+    // the driver receives it (via storage or HA event), sets its own
+    // _crossDeviceFollowerUntil and becomes a follower for 2 minutes — the driver
+    // then stops auto-advancing and the cast/Roku loses its leader.
+    const _nowForFollowerCheck = Date.now();
+    const _isInFollowerMode = this._hasCrossDeviceSync() &&
+        _nowForFollowerCheck < (this._crossDeviceFollowerUntil || 0);
+    if (!this._isLocallyPaused() && !_isInFollowerMode) {
+      this._writeSharedQueueState();
+    }
+
+    this._pushCurrentToCast();
+
     this.requestUpdate();
   }
 
@@ -6739,6 +9867,13 @@ class MediaCard extends LitElement {
   }
 
   _onVideoPause() {
+    // Ignore pauses triggered internally by cast sync (would pollute sync group state
+    // and set _videoUserInteracted which prevents slideshow auto-advance).
+    if (this._castSyncPausing) {
+      this._castSyncPausing = false;
+      return;
+    }
+
     // CRITICAL: Ignore pause events when card is disconnected
     // Browser fires pause AFTER disconnectedCallback when navigating away
     if (!this.isConnected) {
@@ -6755,11 +9890,18 @@ class MediaCard extends LitElement {
     
     // V5.6.4: Verify video element still exists in DOM before processing pause
     // Pause events can fire after navigation completes and video is removed
-    const videoElement = this.renderRoot?.querySelector('video');
+    const videoElement = this.renderRoot?.querySelector('video:not(.live-photo-video)');
     const isCurrentlyVideo = this._isVideoFile(this.currentMedia?.media_content_id || '');
     
     if (!videoElement || !isCurrentlyVideo) {
       this._log('⏸️ Ignoring video pause - no video in DOM (navigated to image)');
+      return;
+    }
+
+    // Browser fires a 'pause' event immediately after 'ended' as part of the ended
+    // algorithm. This is not a user action — ignore it.
+    if (videoElement.ended) {
+      this._log('⏸️ Ignoring video pause - video ended naturally');
       return;
     }
     
@@ -6779,12 +9921,41 @@ class MediaCard extends LitElement {
 
   // V5: Track video seeking (user interaction)
   _onVideoSeeking(e) {
+    // V5.6.8: Track that we're in the middle of a seek operation
+    this._videoIsSeeking = true;
+
+    // Suppress user-interaction marking for code-driven seeks (cast position snaps,
+    // drift corrections). _suppressSeekInteraction is set before any programmatic
+    // currentTime assignment; the seeking event fires asynchronously so the flag
+    // is still set when this handler runs.
+    if (this._suppressSeekInteraction) {
+      this._suppressSeekInteraction = false;
+      return;
+    }
+    
     // V5.6.4: Only mark as user interaction if video has started playing
     // Browser fires seeking events during initial load - ignore those
     const video = e.target;
     if (video && video.currentTime >= 0.5) {
       this._videoUserInteracted = true;
       this._log('🎬 User interacted with video (seek) - will play to completion');
+      // If this card is a follower, claim driver so the original driver doesn't advance
+      // the video at max_video_duration while the user is seeking/watching it.
+      if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+        this._claimDriverRole();
+        this._writeSharedQueueState();
+      }
+    }
+  }
+  
+  // V5.6.8: Track when seeking finishes
+  _onVideoSeeked(e) {
+    this._videoIsSeeking = false;
+    // Update last video time to current position after seek completes
+    // This prevents the next timeupdate from thinking video looped
+    const video = e.target;
+    if (video) {
+      this._lastVideoTime = video.currentTime;
     }
   }
   
@@ -6793,12 +9964,43 @@ class MediaCard extends LitElement {
     this._videoUserInteracted = true;
     this._log('🎬 User interacted with video (click) - will play to completion');
   }
+  
+  // V5.6.8: Handle video click - toggle controls and overlays together
+  // Extracted to method for performance (avoids creating new function on every render)
+  _onVideoClickToggle(e) {
+    // Check if click is on video itself (not controls)
+    if (e.target.tagName === 'VIDEO') {
+      // Stop propagation to prevent _handleTap from also toggling
+      e.stopPropagation();
+      e.preventDefault();
+      
+      // Mark as user interaction for video timer logic
+      this._videoUserInteracted = true;
+      
+      // Debug: log state before toggle
+      this._log(`🎬 BEFORE: controlsVisible=${this._videoControlsVisible}, hideOverlays=${this._hideBottomOverlaysForVideo}`);
+      
+      // Toggle controls and overlays together (inverse relationship)
+      if (this.config.video_controls_on_tap !== false) {
+        this._videoControlsVisible = !this._videoControlsVisible;
+        this._hideBottomOverlaysForVideo = !this._hideBottomOverlaysForVideo;
+        this._log(`🎬 AFTER: controlsVisible=${this._videoControlsVisible}, hideOverlays=${this._hideBottomOverlaysForVideo}`);
+      } else {
+        // Legacy behavior when video_controls_on_tap: false
+        this._hideBottomOverlaysForVideo = !this._hideBottomOverlaysForVideo;
+        this._log(`🎬 Bottom overlays ${this._hideBottomOverlaysForVideo ? 'hidden' : 'shown'}`);
+      }
+      this.requestUpdate();
+    } else {
+      this._log(`🎬 Click on non-VIDEO element: ${e.target.tagName}`);
+    }
+  }
 
   // V4 CODE REUSE: Check if we should wait for video to complete before advancing
   // Based on V4 lines 3259-3302
   // V5 ENHANCEMENT: If user has interacted with video, ignore video_max_duration and play to end
   async _shouldWaitForVideoCompletion() {
-    const videoElement = this.renderRoot?.querySelector('video');
+    const videoElement = this.renderRoot?.querySelector('video:not(.live-photo-video)');
     
     // No video playing, don't wait
     if (!videoElement || !this.mediaUrl || this.currentMedia?.media_content_type?.startsWith('image')) {
@@ -6846,11 +10048,22 @@ class MediaCard extends LitElement {
   }
 
   _onVideoEnded() {
+    if (this._onLivePhotoVideoEnded()) {
+      this._log('🎞️ Live Photo motion clip ended - returning to still frame');
+      return;
+    }
+
     const endTime = new Date();
     this._log(`🎬 Video ended at ${endTime.toLocaleTimeString()}:`, this.mediaUrl);
     
     // V5.6.4: Mark that video has completed first playthrough
     this._videoHasEnded = true;
+    
+    // V5.6.7: Show bottom overlays when video ends (if they were hidden)
+    if (this._hideBottomOverlaysForVideo) {
+      this._hideBottomOverlaysForVideo = false;
+      this.requestUpdate();
+    }
     
     // V5.6.5: Check if we should restart video (short video with loop enabled)
     const autoAdvanceSeconds = this.config?.auto_advance_seconds || 
@@ -6862,8 +10075,16 @@ class MediaCard extends LitElement {
       const elapsedSeconds = Math.floor(elapsedMs / 1000);
       
       if (elapsedSeconds < autoAdvanceSeconds) {
+        // If navigation to a new video is already in progress, do NOT restart the old
+        // video. Restarting fires canplay which consumes _pendingNavigationIndex for the
+        // wrong video, causing the stale-check in _setMediaUrl to reject the real
+        // navigation and leaving the follower stuck on the old clip.
+        if (this._navigatingAway) {
+          this._log(`🔁 Skipping loop restart — navigation already in progress (_navigatingAway)`);
+          return;
+        }
         this._log(`🔁 Short video with loop enabled (${elapsedSeconds}s < ${autoAdvanceSeconds}s auto-advance) - restarting video`);
-        const videoElement = this.shadowRoot?.querySelector('video');
+        const videoElement = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
         if (videoElement) {
           videoElement.currentTime = 0;
           videoElement.play().catch(err => this._log('Error restarting video:', err));
@@ -6883,6 +10104,53 @@ class MediaCard extends LitElement {
     
     // If we have auto-advance configured, advance to next media after video completes
     if (hasAutoAdvance) {
+      // V5.6.9: Don't advance if slideshow is paused
+      if (this._isPaused) {
+        this._log('🎬 Video completed but slideshow is paused - not advancing');
+        return;
+      }
+
+      // Don't call _loadNext() if a sync-driven navigation is already in flight.
+      // _loadNext() increments _navigationGeneration which makes the in-flight
+      // _resolveMediaUrl stale, causing the navigation to be silently dropped.
+      if (this._navigatingAway) {
+        this._log('🎬 Video completed but navigation already in progress — skipping auto-advance');
+        return;
+      }
+      
+      if (this._castEntityId) {
+        // Cast is active: don't advance yet — poll Roku via ECP until it finishes.
+        // This keeps the card and the TV in sync; the TV is the source of truth for
+        // when to move on.  The end-watcher also sends the pre-end pause to Roku
+        // when it's within 1.5s of its end, preventing the xcast banner from
+        // appearing between videos.
+        const videoEl = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+        const dur = (videoEl?.duration && isFinite(videoEl.duration))
+          ? videoEl.duration
+          : parseFloat(this._currentMetadata?.duration || '0');
+        this._log(`🎬 Video completed — cast active, waiting for Roku to finish (dur=${dur.toFixed(1)}s)`);
+        this._startCastEndWatch(this._castEntityId, dur);
+        return;
+      }
+
+      // Cross-device follower: don't advance immediately — wait for the leader's sync
+      // event (which will arrive once the leader finishes its own advance or cast end-watch).
+      // A 10-second safety timer advances us independently if the leader goes away.
+      if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+        this._log('🎬 Video completed naturally — cross-device follower, awaiting leader sync');
+        if (!this._videoEndFollowerTimer) {
+          const mediaAtEnd = this.currentMedia;
+          this._videoEndFollowerTimer = setTimeout(() => {
+            this._videoEndFollowerTimer = null;
+            if (this.currentMedia === mediaAtEnd && !this._navigatingAway) {
+              this._log('🎬 Follower video-end safety advance — no leader sync within 10s');
+              this._loadNext().catch(() => {});
+            }
+          }, 10000);
+        }
+        return;
+      }
+
       this._log('🎬 Video completed naturally - advancing to next media');
       setTimeout(async () => {
         // Check for new files first (at position 1 in sequential mode)
@@ -6932,10 +10200,30 @@ class MediaCard extends LitElement {
   }
 
   _onVideoTimeUpdate(e) {
+    const video = e.target;
+    if (!video) return;
+
+    // Fallback pre-end cast pause: if we have an active Roku cast and the primary
+    // setTimeout-based pre-end pause hasn't fired yet, send it via timeupdate once
+    // we're within 3 seconds of the end. Handles cases where duration was 0/unknown
+    // at sync-start time, or where the calculated timeout was slightly too short.
+    if (this._castEntityId && !this._castPreEndPauseSent &&
+        video.duration > 2 && !video.paused && !video.ended &&
+        (video.duration - video.currentTime) <= 0.5) {
+      this._sendCastPreEndPause(this._castEntityId);
+    }
+
     // V5.6.4: Detect when looping video wraps back to beginning
     // The 'ended' event doesn't fire for videos with loop attribute
-    const video = e.target;
-    if (!video || !this.config.video_loop) return;
+    if (!this.config.video_loop) return;
+    
+    // V5.6.8: Ignore time updates during user seeking - seeking also causes backward time jumps
+    // but shouldn't be treated as video loop completion
+    if (this._videoIsSeeking) return;
+    
+    // V5.6.8: If user has interacted (seek, pause, etc), don't detect loops at all
+    // User is controlling the video manually, we'll play to completion regardless
+    if (this._videoUserInteracted) return;
     
     const currentTime = video.currentTime;
     
@@ -6966,33 +10254,1108 @@ class MediaCard extends LitElement {
   }
 
   _onVideoLoadedMetadata() {
-    const video = this.shadowRoot?.querySelector('video');
-    if (video && this.config.video_muted) {
-      // Ensure video is actually muted and the mute icon is visible
-      video.muted = true;
-      // Force the video controls to update by toggling muted state
+    const video = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+    if (video) {
+      // V5.6.12: Apply user mute preference if valid, otherwise use config default
+      const shouldBeMuted = this._getEffectiveMuteState();
+      video.muted = shouldBeMuted;
+      this._log(`🔊 Video loaded - muted=${shouldBeMuted} (preference=${this._userMutePreference}, valid=${this._isUserMutePreferenceValid()})`);
+      
+      // Force the video controls to update by toggling muted state.
+      // Only safe when the video is still paused — toggling muted on a playing
+      // video triggers Chrome's autoplay policy ("Unmuting failed") which
+      // force-pauses the element, and the card then misinterprets it as a
+      // deliberate user pause and stops the slideshow.
       setTimeout(() => {
-        video.muted = false;
-        video.muted = true;
+        if (!video || !video.paused) return; // skip if already playing
+        this._suppressVolumeChangeHandler = true;
+        const currentMuted = video.muted;
+        video.muted = !currentMuted;
+        video.muted = currentMuted;
+        this._suppressVolumeChangeHandler = false;
       }, 50);
     }
   }
+
+  // V5.6.12: Check if user's mute preference is still valid (within timeout)
+  // Timeout of 0 means "never timeout" - preference persists forever
+  _isUserMutePreferenceValid() {
+    if (this._userMutePreference === null) return false;
+    const timeout = this.config?.mute_preference_timeout ?? 300;
+    // Timeout of 0 = never expire
+    if (timeout === 0) return true;
+    const elapsed = (Date.now() - this._mutePreferenceTimestamp) / 1000;
+    return elapsed < timeout;
+  }
+
+  // V5.6.12: Get the effective mute state (user preference if valid, else config default)
+  _getEffectiveMuteState() {
+    if (this._isUserMutePreferenceValid()) {
+      return this._userMutePreference;
+    }
+    // Fall back to config default (video_muted defaults to true)
+    return this.config?.video_muted !== false;
+  }
+
+  // V5.6.12: Toggle mute preference and apply to current video if playing
+  _handleMuteToggle(e) {
+    e.stopPropagation();
+    e.preventDefault();
+    
+    // Restart timer on touch (gives user full time to choose next action)
+    if (this._showButtonsExplicitly) {
+      this._startActionButtonsHideTimer();
+    }
+    
+    // Toggle the preference
+    const currentEffective = this._getEffectiveMuteState();
+    this._userMutePreference = !currentEffective;
+    this._mutePreferenceTimestamp = Date.now();
+    
+    // V5.8: Unmuting counts as a user interaction - video should play to end
+    if (!this._userMutePreference) {
+      this._videoUserInteracted = true;
+      this._log('🎬 User unmuted via action button - will play to completion');
+      // If this card is a follower, claim driver so the original driver doesn't advance
+      // the video at max_video_duration while the user is watching it with audio.
+      if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+        this._claimDriverRole();
+        this._writeSharedQueueState();
+      }
+    }
+    
+    this._log(`🔊 Mute toggled: ${currentEffective} → ${this._userMutePreference}`);
+    
+    // Apply to current video if one is playing
+    const video = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+    if (video) {
+      video.muted = this._userMutePreference;
+      
+      // If unmuting, we need to handle potential autoplay policy issues
+      if (!this._userMutePreference && video.paused) {
+        // Try to play - this user interaction should unlock audio
+        video.play().catch(err => {
+          this._log(`🔊 Unmuted playback failed, reverting to muted:`, err.message);
+          // Revert if browser blocks unmuted playback
+          video.muted = true;
+          this._userMutePreference = true;
+          this._mutePreferenceTimestamp = Date.now();
+          this.requestUpdate();
+        });
+      }
+    }
+    
+    this.requestUpdate();
+  }
+
+  // V5.8: Track mute/unmute via native browser video controls
+  // _handleMuteToggle updates _userMutePreference BEFORE setting video.muted, so for action
+  // button changes video.muted already matches _getEffectiveMuteState() when this fires.
+  // A mismatch means the change came from the native controls.
+  _onVideoVolumeChange(e) {
+    if (this._suppressVolumeChangeHandler) return;
+    const video = e.target;
+    if (!video) return;
+
+    const expectedMuted = this._getEffectiveMuteState();
+    if (video.muted !== expectedMuted) {
+      // Sync our preference to match what native controls set
+      this._userMutePreference = video.muted;
+      this._mutePreferenceTimestamp = Date.now();
+      this._log(`🔊 Native controls changed mute: ${expectedMuted} → ${video.muted}`);
+
+      // V5.8: Unmuting counts as user interaction - video should play to end
+      if (!video.muted) {
+        this._videoUserInteracted = true;
+        this._log('🎬 User unmuted via native controls - will play to completion');
+        // If this card is a follower, claim driver so the original driver doesn't advance
+        // the video at max_video_duration while the user is watching it with audio.
+        if (this._hasCrossDeviceSync() && Date.now() < (this._crossDeviceFollowerUntil || 0)) {
+          this._claimDriverRole();
+          this._writeSharedQueueState();
+        }
+      }
+
+      this.requestUpdate();
+    }
+  }
+
+  // ─── Shared Queue ──────────────────────────────────────────────────────────
+  // Two transport layers, selected automatically:
+  //   • Cross-device (media-index configured): service calls + HA websocket events
+  //   • Single-device fallback: localStorage + window CustomEvent
+
+  // Return the media_index entity_id configured on this card, or null.
+  _getMediaIndexEntityId() {
+    return this.config?.media_index?.entity_id || null;
+  }
+
+  // Is cross-device sync available?
+  _getEffectiveSyncGroupId() {
+    return this.config?.shared_queue_id || null;
+  }
+
+  _hasCrossDeviceSync() {
+    return !!(this._getEffectiveSyncGroupId() && this._getMediaIndexEntityId() && this.hass);
+  }
+
+  // ── Write path ──────────────────────────────────────────────────────────────
+  // Called after every navigation commit. Debounced to avoid hammering the service.
+  // pauseIntent=true ONLY for user-initiated pause/resume actions — navigation writes
+  // must NOT set it, otherwise Device B's navigation will overwrite Device A's local
+  // pause state.
+  _writeSharedQueueState(pauseIntent = false, forcedIsPaused = undefined) {
+    const id = this._getEffectiveSyncGroupId();
+    if (!id || !this.navigationQueue?.length) return;
+    // Do not write if this card is blocked due to a config mismatch — we must not
+    // corrupt the active queue or override the driver's state.
+    if (this._configMismatchDetected) return;
+
+    // Echo-prevention: skip the write that would bounce an incoming navigation sync
+    // back to the sender. BUT always allow explicit pause/resume writes through so
+    // that a pause arriving simultaneously with a navigation doesn't get swallowed.
+    // Uses a timestamp window instead of a one-shot boolean so that double-load events
+    // (e.g. rapid-navigation clearing both layers fires two onload events for the same
+    // URL) don't consume the flag on the first load and then write on the second.
+    if (!pauseIntent && this._suppressSyncWriteUntil && Date.now() < this._suppressSyncWriteUntil) {
+      // Don't clear _suppressSyncWriteUntil — let it expire naturally so subsequent
+      // loads within the same sync event window are also suppressed.
+      if (this._syncWriteTimer) {
+        clearTimeout(this._syncWriteTimer);
+        this._syncWriteTimer = null;
+      }
+      return;
+    }
+    this._suppressSyncWriteUntil = 0;
+
+    // Capture and consume the one-shot cast seek position so it travels in this broadcast.
+    const castSeekPosition = this._pendingSyncCastSeekPosition;
+    this._pendingSyncCastSeekPosition = null;
+    // Preserve for the 500ms-debounced cross-device write — _pendingSyncCastSeekPosition
+    // would be null by the time the timer fires without this separate accumulator.
+    if (castSeekPosition !== null && castSeekPosition !== undefined) {
+      this._pendingXDeviceCastSeekPosition = castSeekPosition;
+    }
+    // Preserve forcedIsPaused so the cross-device write can override is_paused correctly
+    // (e.g. cast startup group-pause where casting card _isPaused is still false).
+    if (forcedIsPaused !== undefined) {
+      this._pendingXDeviceIsPaused = forcedIsPaused;
+    }
+
+    // Always write localStorage for instant same-device sync
+    try {
+      const data = {
+        queue: this.navigationQueue.map(item => item.media_content_id),
+        currentIndex: this.navigationIndex,
+        // Include metadata for the current item so receiving cards can display it
+        // immediately without needing a separate media-index fetch.
+        currentMetadata: this._currentMetadata || this._pendingMetadata || null,
+        isPaused: forcedIsPaused !== undefined ? forcedIsPaused : this._isPaused,
+        pauseIntent,
+        castSeekPosition: castSeekPosition !== null ? castSeekPosition : undefined,
+        updatedAt: Date.now(),
+        sourceCardId: this._cardId,
+        sessionOverride: this._sessionOverride || null,
+        configFields: this._localConfigFields || null,
+        // Signal whether this card is the driver. Followers use this to avoid setting
+        // _crossDeviceFollowerUntil when they receive a sync from another follower.
+        isDriverCard: !this._hasCrossDeviceSync() || Date.now() >= (this._crossDeviceFollowerUntil || 0),
+      };
+      localStorage.setItem(`ha-media-card:${id}`, JSON.stringify(data));
+      // Broadcast within same window (storage event doesn't fire for same-window writes)
+      window.dispatchEvent(new CustomEvent('ha-media-card-sync', { detail: { sharedQueueId: id, ...data } }));
+    } catch (_e) {}
+
+    // Cross-device: debounced service call.
+    // Accumulate pauseIntent across debounce resets so that a pause write that arrives
+    // just before a navigation write doesn't silently lose the intent.
+    // Cross-device write: only if we are acting as the driver (not a follower that
+    // recently received a sync event from another device).  Pause/resume intent always
+    // passes through so the user can group-pause from any device.
+    if (this._hasCrossDeviceSync() && (pauseIntent || Date.now() >= (this._crossDeviceFollowerUntil || 0))) {
+      this._pendingSyncPauseIntent = (this._pendingSyncPauseIntent || false) || pauseIntent;
+      if (this._syncWriteTimer) clearTimeout(this._syncWriteTimer);
+      this._syncWriteTimer = setTimeout(() => {
+        this._syncWriteTimer = null;
+        const intent = this._pendingSyncPauseIntent || false;
+        this._pendingSyncPauseIntent = false;
+        const xdSeekPos = this._pendingXDeviceCastSeekPosition;
+        this._pendingXDeviceCastSeekPosition = null;
+        const xdIsPaused = this._pendingXDeviceIsPaused;
+        this._pendingXDeviceIsPaused = undefined;
+        this._writeSharedQueueStateToMediaIndex(intent, xdSeekPos, xdIsPaused);
+      }, 500);
+    }
+  }
+
+  async _writeSharedQueueStateToMediaIndex(pauseIntent = false, castSeekPosition = null, isPausedOverride = undefined) {
+    const id = this._getEffectiveSyncGroupId();
+    if (!id || !this.navigationQueue?.length) return;
+    if (this._configMismatchDetected) return;
+    try {
+      const entityId = this._getMediaIndexEntityId();
+      const queue = this.navigationQueue.map(item => item.media_content_id);
+      await this.hass.connection.sendMessagePromise({
+        type: 'call_service',
+        domain: 'media_index',
+        service: 'update_sync_state',
+        service_data: {
+          sync_group: id,
+          queue,
+          current_index: this.navigationIndex,
+          pause_intent: pauseIntent,
+          source_card_id: this._cardId,
+          current_metadata: JSON.stringify(this._currentMetadata || this._pendingMetadata || null),
+          written_at: Date.now(),
+          session_override: JSON.stringify(this._sessionOverride || null),
+          config_fields: JSON.stringify(this._localConfigFields || null),
+          ...(castSeekPosition !== null ? { cast_seek_position: castSeekPosition } : {}),
+          is_paused: isPausedOverride !== undefined ? isPausedOverride : this._isPaused,
+          // Signal whether this card is the driver so receiving cards don't become followers
+          // of another follower's write (e.g. a follower broadcasting a pauseIntent).
+          is_driver_card: !this._hasCrossDeviceSync() || Date.now() >= (this._crossDeviceFollowerUntil || 0),
+        },
+        target: { entity_id: entityId },
+      });
+      // Record when we last wrote so stale events from followers can be rejected
+      this._lastHaSyncWrittenAt = Date.now();
+      this._log(`🔗 Sync state written to media_index for group '${id}'`);
+    } catch (e) {
+      this._log('⚠️ Failed to write shared queue to media_index:', e);
+    }
+  }
+
+  // ── Read path (first load) ──────────────────────────────────────────────────
+  // Returns true and populates navigationQueue/navigationIndex if state was found.
+  async _tryRestoreFromSharedQueue() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return false;
+
+    // When a filter-change reinit was triggered by an incoming sync event, restore
+    // directly from the stashed queue data so the follower adopts the leader's exact
+    // position immediately instead of rebuilding from index 0. This check must come
+    // before the _skipSharedQueueRestore guard (which would otherwise block the restore).
+    if (this._pendingFilterChangeRestore && this._pendingFilterChangeRestore.queue?.length) {
+      const pending = this._pendingFilterChangeRestore;
+      this._pendingFilterChangeRestore = null;
+      return this._applyRestoredState(pending.queue, pending.currentIndex, pending.metadata);
+    }
+
+    // Skip restore when _syncFromSharedQueueOnReconnect already applied the correct
+    // (fresher, localStorage-preferred) state during this reconnect cycle. Without this
+    // guard the init-path restore would overwrite the reconnect state with stale HA data.
+    if (this._reconnectSyncApplied) {
+      this._reconnectSyncApplied = false;
+      this._log('⏭️ Shared queue init-path restore skipped: reconnect sync already applied state');
+      return true; // signal success so init uses navigationQueue[navigationIndex] instead of _loadNext()
+    }
+
+    // Skip restore when reinit was triggered by an explicit session override change
+    // (filter picker apply/clear). The old queue belongs to a different content set.
+    if (this._skipSharedQueueRestore) {
+      this._skipSharedQueueRestore = false;
+      return false;
+    }
+
+    // Cross-device: fetch from media-index (authoritative, any device may have written it)
+    if (this._hasCrossDeviceSync()) {
+      try {
+        const entityId = this._getMediaIndexEntityId();
+        const resp = await this.hass.connection.sendMessagePromise({
+          type: 'call_service',
+          domain: 'media_index',
+          service: 'get_sync_state',
+          service_data: { sync_group: id },
+          target: { entity_id: entityId },
+          return_response: true,
+        });
+        const data = resp?.response;
+        if (data?.found && Array.isArray(data.queue) && data.queue.length) {
+          // ── Config mismatch check ──
+          // Stored state has a different config (e.g. entity_id changed). This just
+          // means the cache is stale — silently skip restore and let the card init
+          // fresh. Do NOT set _configMismatchDetected: that flag is only for live
+          // cross-device sync events where another card with a different config is
+          // actively trying to push its queue to this card.
+          if (data.config_fields && this._localConfigFields) {
+            let storedFields;
+            try { storedFields = typeof data.config_fields === 'string' ? JSON.parse(data.config_fields) : data.config_fields; } catch (_e) { storedFields = null; }
+            if (storedFields) {
+              const diff = this._diffConfigFields(this._localConfigFields, storedFields);
+              if (diff.length > 0) {
+                this._log('⏭️ Shared queue restore skipped: stored config is stale (', diff.map(d => d.key).join(', '), ')');
+                return false; // stale data — init fresh, no error banner
+              }
+            }
+          }
+
+          // ── Stale filter TTL (8 hours) ──
+          const FILTER_TTL_MS = 8 * 60 * 60 * 1000;
+          const stateAgeMs = data.updated_at ? (Date.now() - data.updated_at * 1000) : Infinity;
+          let storedOverride = null;
+          if (stateAgeMs < FILTER_TTL_MS && data.session_override) {
+            try { storedOverride = typeof data.session_override === 'string' ? JSON.parse(data.session_override) : data.session_override; } catch (_e) {}
+          }
+          if (storedOverride && JSON.stringify(storedOverride) !== JSON.stringify(this._sessionOverride ?? null)) {
+            this._suppressFilterBroadcast = true;
+            this._applySessionOverride(storedOverride);
+            return false; // reinit will load fresh; queue restore will happen on next broadcast
+          }
+          if (!storedOverride && this._sessionOverride) {
+            this._suppressFilterBroadcast = true;
+            this._clearSessionOverride();
+            return false;
+          }
+
+          // Parse current_metadata (stored as JSON string by media_index service)
+          let restoredMetadata = null;
+          try {
+            restoredMetadata = typeof data.current_metadata === 'string'
+              ? JSON.parse(data.current_metadata)
+              : (data.current_metadata || null);
+          } catch (_e) {}
+          return this._applyRestoredState(data.queue, data.current_index, restoredMetadata);
+        }
+      } catch (e) {
+        this._log('⚠️ Could not fetch sync state from media_index, falling back to localStorage:', e);
+      }
+    }
+
+    // Single-device fallback: localStorage
+    try {
+      const raw = localStorage.getItem(`ha-media-card:${id}`);
+      if (!raw) return false;
+      const data = JSON.parse(raw);
+      if (!Array.isArray(data.queue) || !data.queue.length) return false;
+
+      // ── Config mismatch check (localStorage) ──
+      // Stale stored config means the user changed settings — skip restore silently.
+      if (data.configFields && this._localConfigFields) {
+        const diff = this._diffConfigFields(this._localConfigFields, data.configFields);
+        if (diff.length > 0) {
+          this._log('⏭️ Shared queue localStorage restore skipped: stored config is stale (', diff.map(d => d.key).join(', '), ')');
+          return false;
+        }
+      }
+
+      // ── Stale filter TTL (localStorage, updatedAt is ms) ──
+      const FILTER_TTL_MS = 8 * 60 * 60 * 1000;
+      const stateAgeMs = data.updatedAt ? (Date.now() - data.updatedAt) : Infinity;
+      let storedOverride = data.sessionOverride ?? null;
+      if (stateAgeMs >= FILTER_TTL_MS) storedOverride = null;
+      if (storedOverride && JSON.stringify(storedOverride) !== JSON.stringify(this._sessionOverride ?? null)) {
+        this._suppressFilterBroadcast = true;
+        this._applySessionOverride(storedOverride);
+        return false;
+      }
+      if (!storedOverride && this._sessionOverride) {
+        this._suppressFilterBroadcast = true;
+        this._clearSessionOverride();
+        return false;
+      }
+
+      return this._applyRestoredState(data.queue, data.currentIndex, data.currentMetadata || null);
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  // ── Read path (reconnect) ───────────────────────────────────────────────────
+  async _syncFromSharedQueueOnReconnect() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return;
+
+    let queue = null, currentIndex = 0, sessionOverride = null, configFields = null, updatedAtSec = 0;
+
+    // Cross-device: fetch from media-index
+    if (this._hasCrossDeviceSync()) {
+      try {
+        const entityId = this._getMediaIndexEntityId();
+        const resp = await this.hass.connection.sendMessagePromise({
+          type: 'call_service',
+          domain: 'media_index',
+          service: 'get_sync_state',
+          service_data: { sync_group: id },
+          target: { entity_id: entityId },
+          return_response: true,
+        });
+        const data = resp?.response;
+        if (data?.found && Array.isArray(data.queue) && data.queue.length) {
+          queue = data.queue;
+          currentIndex = typeof data.current_index === 'number' ? data.current_index : 0;
+          updatedAtSec = data.updated_at || 0;
+          try { sessionOverride = data.session_override ? JSON.parse(data.session_override) : null; } catch (_e) {}
+          try { configFields = data.config_fields ? JSON.parse(data.config_fields) : null; } catch (_e) {}
+        }
+      } catch (e) {
+        this._log('⚠️ Could not fetch sync state from media_index for reconnect:', e);
+      }
+    }
+
+    // Always read localStorage — for same-device sync it is written immediately on every
+    // navigation while the HA write is debounced (~500ms).  If the user switched views
+    // before the debounce fired, HA holds a stale state and localStorage is the ground
+    // truth.  For cross-device sync the other device's HA write will be newer than this
+    // device's own stale localStorage, so the comparison still picks the right winner.
+    try {
+      const raw = localStorage.getItem(`ha-media-card:${id}`);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (Array.isArray(data.queue) && data.queue.length) {
+          const lsUpdatedAtSec = data.updatedAt ? (data.updatedAt / 1000) : 0; // convert ms → s
+          if (!queue) {
+            // HA had nothing — use localStorage unconditionally
+            queue        = data.queue;
+            currentIndex = typeof data.currentIndex === 'number' ? data.currentIndex : 0;
+            sessionOverride = data.sessionOverride ?? null;
+            configFields    = data.configFields    ?? null;
+            updatedAtSec    = lsUpdatedAtSec;
+          } else if (lsUpdatedAtSec > updatedAtSec) {
+            // localStorage is fresher than the HA debounced write — prefer it
+            this._log(`📱 localStorage sync state is fresher than HA (${Math.round(lsUpdatedAtSec)}s vs ${Math.round(updatedAtSec)}s) — using localStorage`);
+            queue        = data.queue;
+            currentIndex = typeof data.currentIndex === 'number' ? data.currentIndex : 0;
+            sessionOverride = data.sessionOverride ?? null;
+            configFields    = data.configFields    ?? null;
+            updatedAtSec    = lsUpdatedAtSec;
+          }
+        }
+      }
+    } catch (_e) {}
+
+    if (!queue) return;
+
+    // ── Config mismatch check ──
+    // Stale stored config (e.g. entity_id changed) — skip sync silently, no error banner.
+    if (configFields && this._localConfigFields) {
+      const diff = this._diffConfigFields(this._localConfigFields, configFields);
+      if (diff.length > 0) {
+        this._log('⏭️ Shared queue reconnect sync skipped: stored config is stale (', diff.map(d => d.key).join(', '), ')');
+        return;
+      }
+    }
+
+    // ── Stale filter TTL (8 hours) ──
+    const FILTER_TTL_MS = 8 * 60 * 60 * 1000;
+    const stateAgeMs = updatedAtSec ? (Date.now() - updatedAtSec * 1000) : Infinity;
+    if (stateAgeMs >= FILTER_TTL_MS) sessionOverride = null;
+    if (sessionOverride && JSON.stringify(sessionOverride) !== JSON.stringify(this._sessionOverride ?? null)) {
+      this._suppressFilterBroadcast = true;
+      this._applySessionOverride(sessionOverride);
+      return; // reinit will restore fresh
+    }
+    if (!sessionOverride && this._sessionOverride) {
+      this._suppressFilterBroadcast = true;
+      this._clearSessionOverride();
+      return;
+    }
+
+    const newIndex = Math.min(currentIndex, queue.length - 1);
+    const newPath = queue[newIndex];
+    this.navigationQueue = queue.map(mediaId => ({
+      media_content_id: mediaId,
+      media_content_type: MediaUtils.detectFileType(mediaId) || 'image',
+      title: mediaId.split('/').pop() || mediaId,
+      metadata: null,
+    }));
+    this.navigationIndex = newIndex;
+    this._reconnectSyncApplied = true; // block _tryRestoreFromSharedQueue from overwriting this state
+    this._suppressLookaheadFill = true;  // prevent independent lookahead fill until first forward navigation
+    this._log(`🔗 Shared queue synced on reconnect: ${this.navigationQueue.length} items, index ${newIndex}`);
+    if (newPath !== this._currentMediaPath) {
+      const item = this.navigationQueue[newIndex];
+      this._clearLivePhotoPlayback();
+      this.currentMedia = item;
+      this._pendingNavigationIndex = newIndex;
+      this._pendingMediaPath = newPath;
+      this._pendingMetadata = null;
+      this._resolveMediaUrl();
+      this.requestUpdate();
+    }
+  }
+
+  // ── Shared helper ───────────────────────────────────────────────────────────
+  _applyRestoredState(queue, rawIndex, currentMetadata = null) {
+    this.navigationQueue = queue.map(mediaId => ({
+      media_content_id: mediaId,
+      media_content_type: MediaUtils.detectFileType(mediaId) || 'image',
+      title: mediaId.split('/').pop() || mediaId,
+      metadata: null,
+    }));
+    this.navigationIndex = Math.min(
+      typeof rawIndex === 'number' ? rawIndex : 0,
+      this.navigationQueue.length - 1
+    );
+    // Apply restored metadata to the current item so it's available immediately on first render
+    if (currentMetadata && this.navigationQueue[this.navigationIndex]) {
+      this.navigationQueue[this.navigationIndex].metadata = currentMetadata;
+    }
+    this._log(`🔗 Shared queue restored: ${this.navigationQueue.length} items, index ${this.navigationIndex}`);
+    this._suppressLookaheadFill = true;  // prevent independent lookahead fill until first forward navigation
+    // Cross-device reconnect grace period: when we restore at the last (or only) slot
+    // the driver may be about to extend the queue and broadcast the next item.  Enter a
+    // deferral window equal to the configured advance interval + 3s safety buffer so
+    // that the driver's HA sync event arrives BEFORE we independently fetch a (potentially
+    // different) item from our own provider.  The window is cancelled as soon as a
+    // sync event is received (in _applySharedQueueUpdate).
+    if (this._hasCrossDeviceSync() && this.navigationIndex >= this.navigationQueue.length - 1) {
+      const advanceSecs = this.config?.auto_advance_seconds ||
+                          this.config?.auto_advance_interval ||
+                          this.config?.auto_advance_duration || 10;
+      const graceMs = advanceSecs * 1000 + 3000;
+      this._crossDeviceProviderFetchUntil = Date.now() + graceMs;
+      this._log(`⏳ Cross-device grace period started (${(graceMs/1000).toFixed(0)}s) — restored at end of shared queue`);
+    }
+    return true;
+  }
+
+  // ── Event listeners ─────────────────────────────────────────────────────────
+  // Subscribe to HA websocket events (cross-device) and window CustomEvent (same-device).
+  _subscribeToSyncEvents() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return;
+
+    // Same-window CustomEvent (instant, no round-trip)
+    this._queueSyncEventHandler = this._onQueueSyncEvent.bind(this);
+    window.addEventListener('ha-media-card-sync', this._queueSyncEventHandler);
+
+    // Same-device cross-tab via storage event
+    this._storageEventHandler = this._onStorageEvent.bind(this);
+    window.addEventListener('storage', this._storageEventHandler);
+
+    // Cross-device: subscribe to HA bus event fired by media_index.update_sync_state.
+    // We use a custom WebSocket command (media_index/subscribe_sync) registered by the
+    // integration rather than the generic subscribe_events command, because subscribe_events
+    // requires admin for custom integration events — non-admin dashboard users would be
+    // refused. The custom command has its own handler that allows any authenticated user.
+    if (this._hasCrossDeviceSync()) {
+      this._haSyncUnsubscribe = this.hass.connection.subscribeMessage(
+        (msg) => this._onHaSyncEvent({ data: msg }),
+        { type: 'media_index/subscribe_sync', sync_group: id }
+      ).catch(e => {
+        this._log('⚠️ Failed to subscribe to media_index sync events:', e);
+        this._haSyncUnsubscribe = null;
+      });
+    }
+  }
+
+  _unsubscribeFromSyncEvents() {
+    if (this._storageEventHandler) {
+      window.removeEventListener('storage', this._storageEventHandler);
+      this._storageEventHandler = null;
+    }
+    if (this._queueSyncEventHandler) {
+      window.removeEventListener('ha-media-card-sync', this._queueSyncEventHandler);
+      this._queueSyncEventHandler = null;
+    }
+    if (this._haSyncUnsubscribe) {
+      // subscribeEvents returns a Promise<unsubscribe fn>; handle both cases
+      Promise.resolve(this._haSyncUnsubscribe).then(unsub => { if (unsub) unsub(); }).catch(() => {});
+      this._haSyncUnsubscribe = null;
+    }
+    if (this._syncWriteTimer) {
+      clearTimeout(this._syncWriteTimer);
+      this._syncWriteTimer = null;
+    }
+  }
+
+  // Same-window leader election for shared_queue_id groups.
+  // Only the leader card runs the auto-advance timer; followers suppress theirs.
+
+  /**
+   * Returns true when this card is paused locally (short press) as opposed to
+   * a group pause (long press).  Locally paused cards navigate silently and
+   * ignore incoming sync navigation events.
+   */
+  _isLocallyPaused() {
+    return this._isPaused && !this._groupPaused;
+  }
+
+  // This prevents two card instances (e.g. on different views of the same dashboard)
+  // from both firing timers and competing over which index to broadcast.
+
+  /** Returns true if this card is (or should act as) the timer leader. */
+  _isSyncLeader() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return true; // No sync group — always act as leader
+    if (!window._mediaCardLeaders) return false;
+    return window._mediaCardLeaders.get(id) === this._cardId;
+  }
+
+  /**
+   * Attempt to register this card as the leader for its sync group.
+   * Succeeds only if the slot is empty.  Returns true if leadership was
+   * claimed (or was already held), false if another card holds the slot.
+   */
+  _tryClaimLeadership() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return true;
+    if (!window._mediaCardLeaders) window._mediaCardLeaders = new Map();
+    const current = window._mediaCardLeaders.get(id);
+    if (!current) {
+      window._mediaCardLeaders.set(id, this._cardId);
+      this._log(`👑 Claimed sync leadership for group '${id}'`);
+      return true;
+    }
+    if (current === this._cardId) return true; // Already the leader
+    this._log(`👥 Sync follower for group '${id}' (leader: ${current})`);
+    return false;
+  }
+
+  /**
+   * Force-claim leadership, displacing any current leader.
+   * Used when the user manually navigates on a follower card — the active
+   * device should become the driver to avoid the old leader overriding it.
+   */
+  /**
+   * Called on every manual navigation.  Handles TWO distinct but related concepts:
+   *
+   * Tier 1 — Same-window timer leadership (window._mediaCardLeaders):
+   *   Only one card per browser tab runs the auto-advance timer.  Manually
+   *   navigating on any card promotes it to timer leader, displacing any other
+   *   card that held the slot.  This prevents two timers competing on the same tab.
+   *
+   * Tier 2 — Cross-device HA write driver (_crossDeviceFollowerUntil):
+   *   Whichever browser/device the user is actively navigating on should write to
+   *   the HA media_index sync state.  Receiving a sync event from another device
+   *   sets _crossDeviceFollowerUntil = now+30s on this card, which blocks the HA
+   *   debounce write.  Manual navigation must clear that deferral unconditionally —
+   *   even if same-window leadership didn't change — so the HA write goes through
+   *   and the other browser receives the navigation update.
+   *
+   * Both tiers' state is reset BEFORE the early-return guard.  That guard only
+   * skips the window._mediaCardLeaders map update and log line; it must never
+   * skip the state resets.
+   */
+  _claimDriverRole() {
+    const id = this.config?.shared_queue_id;
+    if (!id) return;
+    if (!window._mediaCardLeaders) window._mediaCardLeaders = new Map();
+    const prev = window._mediaCardLeaders.get(id);
+
+    // ── Tier 2: cross-device driver mode ──────────────────────────────────────
+    // Clear ALL cross-device follower/deferral state so the HA write goes through
+    // immediately, regardless of whether same-window leadership is changing.
+    this._crossDeviceFollowerUntil = 0;
+    this._crossDeviceLeaderMediaPath = null; // clear so follower window logic doesn't re-extend
+    this._crossDeviceProviderFetchUntil = 0;
+    if (this._crossDeviceGraceRetryTimer) {
+      clearTimeout(this._crossDeviceGraceRetryTimer);
+      this._crossDeviceGraceRetryTimer = null;
+    }
+    // Clear the echo-suppression window.  A sync event from the other device may
+    // have set _suppressSyncWriteUntil just before the user navigated — without
+    // this reset the post-load _writeSharedQueueState() call would be dropped.
+    this._suppressSyncWriteUntil = 0;
+    if (this._syncWriteTimer) {
+      clearTimeout(this._syncWriteTimer);
+      this._syncWriteTimer = null;
+    }
+
+    // ── Tier 1: same-window timer leadership ──────────────────────────────────
+    if (prev === this._cardId) return; // Already this tab's timer leader — Tier 2 reset above is sufficient ✓
+    window._mediaCardLeaders.set(id, this._cardId);
+    this._log(`👑 Claimed driver role for group '${id}' (displaced same-window leader: ${prev})`);
+  }
+
+  /**
+   * Release leadership and notify followers so one can step up.
+   * Called from disconnectedCallback.
+   */
+  _relinquishLeadership() {
+    const id = this.config?.shared_queue_id;
+    if (!id || !window._mediaCardLeaders) return;
+    if (window._mediaCardLeaders.get(id) !== this._cardId) return;
+    window._mediaCardLeaders.delete(id);
+    this._log(`👋 Relinquished sync leadership for group '${id}'`);
+    window.dispatchEvent(new CustomEvent('ha-media-card-leader-vacated', {
+      detail: { sharedQueueId: id }
+    }));
+  }
+
+  // HA websocket event from media_index (cross-device)
+  _onHaSyncEvent(event) {
+    const id = this.config?.shared_queue_id;
+    const data = event.data;
+    if (!id || data?.sync_group !== id) return;
+    // Ignore events we ourselves wrote (media_index echoes back to all subscribers)
+    if (data?.source_card_id === this._cardId) return;
+    // If the user is actively pressing a button on this card, let the manual
+    // navigation complete first.  We do NOT extend the follower window because
+    // this card is in the middle of taking over as driver.
+    if (this._isManualNavigation || this._manualNavLoading) {
+      this._log('🔗 Manual nav in progress (or pending load) — not entering follower mode for this sync event');
+      return;
+    }
+    // Reject sync events that were written before our own last HA write — the sender
+    // was still catching up to us and their state is stale (e.g. a follower card
+    // that loaded item N and wrote sync state just before we advanced to N+1 via the
+    // Roku end-watch, which would bounce us back to N).  Use a 1s tolerance for
+    // minor cross-device clock skew on a local network.
+    if (this._lastHaSyncWrittenAt && (data.written_at || 0) < this._lastHaSyncWrittenAt - 1000) {
+      this._log(`⏭️ Ignoring stale sync event: sender wrote_at=${data.written_at}, our last write=${this._lastHaSyncWrittenAt}`);
+      return;
+    }
+
+    // Mark this card as a cross-device follower for 30 s.  While in follower mode,
+    // auto-advance writes are suppressed so this card doesn't overwrite the driver's
+    // DB state with its own independently-fetched queue items.  The window is generous
+    // enough to cover normal slideshow intervals; if the driver goes away, this card
+    // will naturally take over writing once the window expires.
+    // Only extend the follower window when the sender is acting as the driver.
+    // If a follower broadcasts (e.g. a pauseIntent from a follower card), we must not
+    // become a follower of that follower — the original driver would lose its role.
+    if (data.is_driver_card !== false) {
+      this._crossDeviceFollowerUntil = Date.now() + 120000; // 2-min window — must exceed max slideshow interval
+    }
+    this._lastLeaderSyncReceivedAt = Date.now(); // track that an actual leader sync arrived
+    let currentMetadata;
+    if (data.current_metadata) {
+      try { currentMetadata = JSON.parse(data.current_metadata); } catch (_e) {}
+    }
+    let sessionOverride;
+    try { sessionOverride = data.session_override ? JSON.parse(data.session_override) : null; } catch (_e) { sessionOverride = null; }
+    let configFields;
+    try { configFields = data.config_fields ? JSON.parse(data.config_fields) : null; } catch (_e) { configFields = null; }
+    this._applySharedQueueUpdate({
+      queue: data.queue,
+      currentIndex: data.current_index,
+      currentMetadata,
+      isPaused: data.is_paused,
+      pauseIntent: data.pause_intent,
+      castSeekPosition: typeof data.cast_seek_position === 'number' ? data.cast_seek_position : undefined,
+      updatedAt: data.written_at || 0,
+      sessionOverride,
+      configFields,
+    });
+  }
+
+  // storage event (cross-tab, same device)
+  _onStorageEvent(event) {
+    const id = this.config?.shared_queue_id;
+    if (!id || event.key !== `ha-media-card:${id}` || !event.newValue) return;
+    try {
+      const data = JSON.parse(event.newValue);
+      // Mirror the 30s follower deferral that _onHaSyncEvent sets for cross-device events.
+      // Without this, _suppressSyncWriteUntil expires after 1s and the follower card
+      // writes its (identical) state to HA — wasted service calls and log noise.
+      // Only extend follower window when the sender is the driver (not another follower).
+      if (data.isDriverCard !== false) {
+        this._crossDeviceFollowerUntil = Date.now() + 120000; // 2-min window — must exceed max slideshow interval
+      }
+      this._lastLeaderSyncReceivedAt = Date.now();
+      this._applySharedQueueUpdate(data);
+    } catch (_e) {}
+  }
+
+  // window CustomEvent (same window, instant)
+  _onQueueSyncEvent(event) {
+    const id = this.config?.shared_queue_id;
+    if (!id || event.detail?.sharedQueueId !== id) return;
+    if (event.detail?.sourceCardId === this._cardId) return; // ignore own writes
+    // Mirror the 30s follower deferral that _onHaSyncEvent sets for cross-device events.
+    // Without this, _suppressSyncWriteUntil expires after 1s and the follower card
+    // writes its (identical) state to HA — wasted service calls and log noise.
+    // Only extend follower window when the sender is the driver (not another follower).
+    if (event.detail?.isDriverCard !== false) {
+      this._crossDeviceFollowerUntil = Date.now() + 120000; // 2-min window — must exceed max slideshow interval
+    }
+    this._lastLeaderSyncReceivedAt = Date.now();
+    this._applySharedQueueUpdate(event.detail);
+  }
+
+  // Broadcast the new queue state (with a specific index) without waiting for image load.
+  // Used when the local provider returns a new item so that same-window cards receive
+  // it synchronously (before their own provider awaits complete) and follow along.
+  _earlyBroadcastSyncState(nextIndex) {
+    const id = this.config?.shared_queue_id;
+    if (!id) return;
+    if (this._configMismatchDetected) return;
+    try {
+      const data = {
+        queue: this.navigationQueue.map(qi => qi.media_content_id),
+        currentIndex: nextIndex,
+        isPaused: this._isPaused,
+        updatedAt: Date.now(),
+        sourceCardId: this._cardId,
+        sessionOverride: this._sessionOverride || null,
+        configFields: this._localConfigFields || null,
+        isDriverCard: !this._hasCrossDeviceSync() || Date.now() >= (this._crossDeviceFollowerUntil || 0),
+      };
+      localStorage.setItem(`ha-media-card:${id}`, JSON.stringify(data));
+      window.dispatchEvent(new CustomEvent('ha-media-card-sync', { detail: { sharedQueueId: id, ...data } }));
+    } catch (_e) {}
+  }
+
+  // Apply an incoming queue update from any transport
+  _applySharedQueueUpdate(data) {
+    // ── Config mismatch check ────────────────────────────────────────────────
+    // If this card is already blocked, ignore all further sync events.
+    if (this._configMismatchDetected) return;
+
+    // Check whether the sender's blocking config fields match ours. Only compare
+    // when BOTH sides have published their fields (old clients won't have them).
+    if (data.configFields && this._localConfigFields) {
+      const diff = this._diffConfigFields(this._localConfigFields, data.configFields);
+      if (diff.length > 0) {
+        this._configMismatchDetected = true;
+        this._configMismatchDiff = diff;
+        this._log('🚫 Shared queue config mismatch detected:', diff.map(d => d.key).join(', '));
+        this.requestUpdate();
+        return;
+      }
+    }
+
+    // ── Filter change detection ──────────────────────────────────────────────
+    // If the sender has a different sessionOverride, apply/clear it here before
+    // processing the queue. The receiving card starts fresh (queue cleared) so
+    // users cannot navigate backwards to pre-filter content.
+    if ('sessionOverride' in data) {
+      const incomingJson = JSON.stringify(data.sessionOverride ?? null);
+      const currentJson  = JSON.stringify(this._sessionOverride  ?? null);
+      if (incomingJson !== currentJson) {
+        // Guard against a locally-applied filter being overwritten by a stale sync
+        // event from the previous driver. When the user changes the filter on this
+        // device, _localFilterAppliedAt is stamped and driver role is claimed. Any
+        // incoming event whose timestamp predates that action is stale and must be
+        // rejected — the old driver was still running on the old filter.
+        const _filterEventTs = data.updatedAt || data.written_at || 0;
+        if (this._localFilterAppliedAt && _filterEventTs > 0 && _filterEventTs < this._localFilterAppliedAt) {
+          this._log(`⏭️ Ignoring stale sessionOverride — local filter applied ${Date.now() - this._localFilterAppliedAt}ms ago (event ts=${_filterEventTs})`);
+          return;
+        }
+        // Accept the incoming filter; clear the local-filter-applied marker since
+        // the driver is now in control of the filter state.
+        this._localFilterAppliedAt = null;
+        // Stash the incoming queue so _tryRestoreFromSharedQueue can apply it after
+        // the reinit, putting the follower at the leader's exact position immediately
+        // instead of rebuilding from index 0. Guard against empty queues (e.g. if the
+        // leader broadcast before loading its first item under the new filter).
+        if (Array.isArray(data.queue) && data.queue.length) {
+          this._pendingFilterChangeRestore = {
+            queue: data.queue,
+            currentIndex: data.currentIndex,
+            metadata: data.currentMetadata || null,
+          };
+        }
+        // Extend the echo-suppression window so this card stays silent while the
+        // driver loads its first item under the new filter (anti-ping-pong).
+        this._suppressSyncWriteUntil = Date.now() + 5000;
+        this._suppressFilterBroadcast = true;
+        // Record the leader's current path so timerCallback's window-extension check
+        // works correctly after the filter-change reinit and _pendingFilterChangeRestore
+        // apply. Without this, _crossDeviceLeaderMediaPath stays stale (pointing to the
+        // pre-filter-change item) and the extension check fails when the window expires,
+        // causing the follower to auto-advance with its own random items instead of
+        // waiting for the leader's next broadcast.
+        if (Array.isArray(data.queue) && data.queue.length) {
+          const ri = typeof data.currentIndex === 'number'
+            ? Math.min(data.currentIndex, data.queue.length - 1) : 0;
+          this._crossDeviceLeaderMediaPath = data.queue[ri];
+        }
+        if (data.sessionOverride) {
+          this._applySessionOverride(data.sessionOverride);
+        } else {
+          this._clearSessionOverride();
+        }
+        return; // queue intentionally cleared; wait for driver's next broadcast
+      }
+    }
+
+    if (!Array.isArray(data.queue) || !data.queue.length) return;
+
+    // Reject stale events that arrive out of order. Each write includes a
+    // written_at/updatedAt timestamp (ms epoch). If this event is older than the
+    // most recent one already applied, discard it — it is a delayed HA event from
+    // a previous navigation that arrived after a newer write already advanced us.
+    const eventTs = data.updatedAt || 0;
+    if (eventTs && eventTs < (this._lastAppliedSyncAt || 0)) {
+      this._log(`⏩ Discarding stale sync event (ts=${eventTs}, last=${this._lastAppliedSyncAt})`);
+      return;
+    }
+    if (eventTs) this._lastAppliedSyncAt = eventTs;
+
+    // Clear reconnect grace period — the driver has broadcast its next item so
+    // we no longer need to defer provider fetches.  Also cancel any pending retry
+    // setTimeout so it doesn't fire and independently advance after the sync.
+    this._crossDeviceProviderFetchUntil = 0;
+    if (this._crossDeviceGraceRetryTimer) {
+      clearTimeout(this._crossDeviceGraceRetryTimer);
+      this._crossDeviceGraceRetryTimer = null;
+    }
+
+    // If the user pressed a button on THIS device while the sync arrived, let the
+    // manual navigation win.  The manual _loadNext/_loadPrevious already called
+    // _claimDriverRole() which cleared _crossDeviceFollowerUntil; and
+    // _onHaSyncEvent already returned early so _crossDeviceFollowerUntil was not
+    // re-set.  Nothing further to do here — the manual fetch will complete and
+    // broadcast its own sync event to the driver.
+    if (this._isManualNavigation || this._manualNavLoading) {
+      this._log('\ud83d\uddb1\ufe0f Manual navigation in progress (or pending load) — ignoring incoming sync navigation');
+      return;
+    }
+
+    const newIndex = Math.min(
+      typeof data.currentIndex === 'number' ? data.currentIndex : 0,
+      data.queue.length - 1
+    );
+    const newPath = data.queue[newIndex];
+
+    // Increment generation counter so any _loadNext() suspended in an await will
+    // see that a sync event took priority and should not overwrite our navigation.
+    this._syncNavGeneration = (this._syncNavGeneration || 0) + 1;
+
+    // Apply pause state ONLY when the sender explicitly toggled it (pauseIntent).
+    // Navigation syncs carry the sender's current isPaused as context (for new devices
+    // joining the group) but must NOT overwrite the local pause state — otherwise
+    // Device B playing and Device A paused leads to Device B's navigation writes
+    // continuously unpausing Device A.
+    if (data.pauseIntent === true && typeof data.isPaused === 'boolean' && data.isPaused !== this._isPaused) {
+      const syncVideoEl = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+      if (data.isPaused) {
+        // Incoming group-pause: mark as group-paused so we know to broadcast on resume.
+        // _setPauseState is called here (not before the if/else) so that the else-if
+        // below can check _groupPaused before any state mutation.
+        this._groupPaused = true;
+        this._setPauseState(true);
+        this._pauseTimer();
+        // Also pause the video element so it doesn't finish and auto-advance
+        if (syncVideoEl && !syncVideoEl.paused) {
+          this._castSyncPausing = true; // suppress _onVideoPause side-effects
+          syncVideoEl.pause();
+        }
+        // Seek video to match the cast pause position so all cards are at the same frame.
+        if (typeof data.castSeekPosition === 'number' && syncVideoEl && !syncVideoEl.ended) {
+          syncVideoEl.currentTime = data.castSeekPosition;
+        }
+        // Pause Roku cast if active
+        this._sendCastPlayToggle();
+      } else if (this._groupPaused) {
+        // Incoming group-resume: only apply to cards that were group-paused.
+        // Cards that were independently user-paused (short-press, _groupPaused=false)
+        // must stay paused — a cast group-resume must not force-resume them.
+        this._groupPaused = false;
+        this._setPauseState(false);
+        this._resumeTimer();
+        // Seek to cast start position before resuming so all synced cards are at the same frame.
+        if (typeof data.castSeekPosition === 'number' && syncVideoEl && !syncVideoEl.ended) {
+          syncVideoEl.currentTime = data.castSeekPosition;
+        }
+        if (syncVideoEl && syncVideoEl.paused && !syncVideoEl.ended) {
+          syncVideoEl.play().catch(() => {});
+        }
+        // Resume Roku cast if active
+        this._sendCastPlayToggle();
+      }
+    }
+
+    // Locally paused (short press, not a group pause) — ignore sync navigation.
+    // Group-paused cards still follow navigation from the active card.
+    if (this._isPaused && !this._groupPaused) return;
+
+    // Skip navigation if we are already showing this path OR already navigating to it.
+    // The _pendingMediaPath check prevents duplicate navigation when the same update
+    // arrives via multiple transports (CustomEvent then HA event ~500ms later) before
+    // the image has fully loaded and _currentMediaPath has been committed.
+    // HOWEVER: a second broadcast for the same path may carry metadata that the first
+    // (early) broadcast lacked — apply it even if we skip navigation.
+    if (newPath === this._currentMediaPath || newPath === this._pendingMediaPath) {
+      // Keep leader path current even on same-path syncs so the long-video follower
+      // extension in timerCallback can match correctly.
+      this._crossDeviceLeaderMediaPath = newPath;
+      if (data.currentMetadata) {
+        if (this._pendingMediaPath !== null) {
+          // Still loading — merge into pending so it applies when image loads
+          this._pendingMetadata = { ...(this._pendingMetadata || {}), ...data.currentMetadata };
+        } else {
+          // Already showing — apply directly and re-render
+          this._currentMetadata = { ...(this._currentMetadata || {}), ...data.currentMetadata };
+          this.requestUpdate();
+        }
+      }
+      // Snap the local video to the cast video start position. The casting card broadcasts
+      // this after Roku starts playing so non-casting follower cards (which started the
+      // video immediately) seek to the same point and stay in sync.
+      if (!data.pauseIntent && typeof data.castSeekPosition === 'number') {
+        const castSyncVidEl = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+        if (castSyncVidEl && !castSyncVidEl.ended && Math.abs(castSyncVidEl.currentTime - data.castSeekPosition) > 1) {
+          castSyncVidEl.currentTime = data.castSeekPosition;
+        }
+      }
+      return;
+    }
+    this._log(`🔗 Shared queue sync: navigating to index ${newIndex}`);
+
+    // Reset the auto-advance timer immediately. Without this, the old timer (which may
+    // be only seconds from expiring) would fire before the incoming image loads, call
+    // _loadNext(), exhaust the queue, fetch a DIFFERENT item and broadcast it — causing
+    // a cascade where each of the N cards adds a new item in rapid succession.
+    // _setupAutoRefresh clears the old interval and starts a fresh full-duration one.
+    if (!this._isPaused) {
+      this._setupAutoRefresh();
+    }
+    this.navigationQueue = data.queue.map(mediaId => ({
+      media_content_id: mediaId,
+      media_content_type: MediaUtils.detectFileType(mediaId) || 'image',
+      title: mediaId.split('/').pop() || mediaId,
+      metadata: null,
+    }));
+    this.navigationIndex = newIndex;
+    const item = this.navigationQueue[newIndex];
+    this._clearLivePhotoPlayback();
+    this.currentMedia = item;
+    // Record this path as the leader's current media so followers can detect long
+    // videos and extend their follower window rather than advancing prematurely.
+    this._crossDeviceLeaderMediaPath = newPath;
+    this._pendingNavigationIndex = newIndex;
+    this._pendingMediaPath = newPath;
+    // Use metadata from the sender if provided — avoids a round-trip fetch and
+    // works even when this card has no media-index configured.
+    this._pendingMetadata = data.currentMetadata || null;
+    // Suppress the outgoing write that would otherwise echo this event back.
+    // Use a 5-second window (extended from 1s) to cover slow image loads and
+    // the case where two sync transports arrive with a delay between them
+    // (e.g. CustomEvent fires at T=0, HA websocket event at T=500ms; without a
+    // wide-enough window the follower could write between the two).
+    this._suppressSyncWriteUntil = Date.now() + 5000;
+    if (this._syncWriteTimer) {
+      clearTimeout(this._syncWriteTimer);
+      this._syncWriteTimer = null;
+    }
+    // Mark navigation in progress so the local slideshow timer doesn't fire a
+    // competing _loadNext() while the sync-driven URL resolution is in flight.
+    // _navigatingAway is cleared by _onMediaLoaded / _onVideoCanPlay as normal.
+    this._navigatingAway = true;
+    this._navigationGeneration++;
+    this._cancelActiveMediaPrepare('shared queue navigation');
+    this._resolveMediaUrl();
+    this.requestUpdate();
+    // For media-index cards: kick off a background fetch to get fresher/fuller
+    // metadata (sender may have had stale data too). No-op for non-media-index cards.
+    this._refreshMetadata().catch(err => this._log('⚠️ Sync metadata refresh failed:', err));
+  }
+
+  // ── End Shared Queue ────────────────────────────────────────────────────────
 
   // V4: Keyboard navigation handler
   _handleKeyDown(e) {
     // Handle keyboard navigation
     if (e.key === 'ArrowLeft') {
       e.preventDefault();
+      this._isManualNavigation = true; // V5.6.7: Mark as manual navigation
       this._loadPrevious();
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
+      this._isManualNavigation = true; // V5.6.7: Mark as manual navigation
       this._loadNext();
     } else if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       // Space or Enter on navigation zones acts like a click
       if (e.target.classList.contains('nav-zone-left')) {
+        this._isManualNavigation = true; // V5.6.7: Mark as manual navigation
         this._loadPrevious();
       } else if (e.target.classList.contains('nav-zone-right')) {
+        this._isManualNavigation = true; // V5.6.7: Mark as manual navigation
         this._loadNext();
       }
     } else if (e.key === 'p' || e.key === 'P') {
@@ -7010,7 +11373,8 @@ class MediaCard extends LitElement {
       } else {
         this._setupAutoRefresh();
       }
-      
+      // Broadcast pause state to all synced cards
+      this._writeSharedQueueState(true);
       this.requestUpdate();
     }
   }
@@ -7031,6 +11395,8 @@ class MediaCard extends LitElement {
     } else {
       this._resumeTimer();
     }
+    // Broadcast pause state to all synced cards
+    this._writeSharedQueueState(true);
   }
   
   // V4: Pause state management (copied from ha-media-card.js)
@@ -7049,9 +11415,17 @@ class MediaCard extends LitElement {
   }
 
   _onMediaLoaded(e) {
+    // Clear the manual-nav load-phase flag now that the media has committed to the DOM.
+    // This must happen before any early returns below so the flag is never left set.
+    this._manualNavLoading = false;
+
     // Log media loaded for images (videos log in _onVideoLoadStart)
     if (!this._isVideoFile(this.mediaUrl)) {
       this._log('Media loaded successfully:', this.mediaUrl);
+
+      // V5.6.7: Clear navigation flag now that image is loaded
+      // This prevents timer from firing prematurely during transitions
+      this._navigatingAway = false;
     }
     
     // V5: Clear error state and retry attempts on successful load
@@ -7065,12 +11439,13 @@ class MediaCard extends LitElement {
       const loadedUrl = e?.target?.src;
       const expectedUrl = this.mediaUrl; // Use mediaUrl which has the resolved URL
       
-      // V5.7: Determine which layer just loaded by comparing URLs
+      // V5.6.7: Determine which layer just loaded by comparing URLs
       let loadedLayerIndex = null;
+      let normalizedLoaded = ''; // V5.6.7: Declare outside if block to avoid ReferenceError
       
       if (loadedUrl) {
         // Normalize loaded URL for comparison
-        let normalizedLoaded = loadedUrl;
+        normalizedLoaded = loadedUrl;
         try {
           const url = new URL(loadedUrl);
           normalizedLoaded = url.pathname + url.search;
@@ -7094,7 +11469,22 @@ class MediaCard extends LitElement {
       // This prevents swapping to an old image if navigation moved on during load
       const currentNavigationIndex = this._pendingNavigationIndex ?? this.navigationIndex;
       
-      if (loadedLayerIndex !== null && loadedLayerIndex !== currentNavigationIndex) {
+      // V5.6.7: In panel mode (index -1), check URL match instead of navigation index
+      // This handles the case where the same image is already loading when panel opens
+      let normalizedExpected = expectedUrl || '';
+      try {
+        const expUrl = new URL(expectedUrl);
+        normalizedExpected = expUrl.pathname;
+      } catch (e) {
+        // Already a path
+      }
+      normalizedExpected = normalizedExpected.split('?')[0];
+      const urlMatches = normalizedLoaded && normalizedExpected && normalizedLoaded === normalizedExpected;
+      
+      // Skip layer swap if:
+      // 1. Navigation index doesn't match AND
+      // 2. We're not in panel mode OR the URL doesn't match what we want
+      if (loadedLayerIndex !== null && loadedLayerIndex !== currentNavigationIndex && !(currentNavigationIndex === -1 && urlMatches)) {
         this._log(`⏭️ Skipping layer swap - loaded image is for navigation index ${loadedLayerIndex}, current is ${currentNavigationIndex}`);
         
         // Clear the stale layer URL but DON'T clear _pendingLayerSwap
@@ -7111,10 +11501,10 @@ class MediaCard extends LitElement {
         return; // Don't swap layers, but keep _pendingLayerSwap = true
       }
       
-      // V5.7: If we got here, the loaded image is for the current navigation position
+      // V5.6.7: If we got here, the loaded image is for the current navigation position
       // Just swap immediately - no need to compare URLs since we already validated the navigation index
       this._pendingLayerSwap = false;
-      
+
       // Swap layers to trigger crossfade
       this._frontLayerActive = !this._frontLayerActive;
       this._log(`🔄 Layer swap triggered - now showing layer: ${this._frontLayerActive ? 'front' : 'back'}`);
@@ -7172,6 +11562,18 @@ class MediaCard extends LitElement {
       this._log('✅ Applied pending navigation index on image load');
     }
     
+    // Shared queue: broadcast navigation — suppress if locally paused (short press)
+    // or if in follower mode to avoid echoing the driver's sync event back.
+    const _nowMl = Date.now();
+    const _isFollowerMl = this._hasCrossDeviceSync() && _nowMl < (this._crossDeviceFollowerUntil || 0);
+    if (!this._isLocallyPaused() && !_isFollowerMl) {
+      this._writeSharedQueueState();
+    }
+    // Cast-to-TV: push current item to TV on every image load
+    this._pushCurrentToCast();
+
+    this._scheduleLivePhotoPlayback();
+
     // Trigger re-render to show updated metadata/counters
     this.requestUpdate();
   }
@@ -7197,12 +11599,15 @@ class MediaCard extends LitElement {
   
   // V4: Metadata display methods
   _renderMetadataOverlay() {
-    // Only show if metadata is configured and available
-    if (!this.config.metadata || !this._currentMetadata) {
+    // Only show if metadata is configured and available for the media that is
+    // currently displayed. Pending metadata is intentionally excluded so metadata
+    // does not appear before a slow-loading image/video is actually visible.
+    const activeMetadata = this._currentMetadata;
+    if (!this.config.metadata || !activeMetadata) {
       return html``;
     }
 
-    const metadataText = this._formatMetadataDisplay(this._currentMetadata);
+    const metadataText = this._formatMetadataDisplay(activeMetadata);
     if (!metadataText) {
       return html``;
     }
@@ -7270,7 +11675,7 @@ class MediaCard extends LitElement {
       
       // Priority 3: Filesystem date as last fallback
       if (!date && metadata.date) {
-        date = metadata.date;
+        date = (metadata.date instanceof Date) ? metadata.date : new Date(metadata.date);
       }
       
       if (date && !isNaN(date.getTime())) {
@@ -7293,10 +11698,32 @@ class MediaCard extends LitElement {
         parts.push('⭐'.repeat(Math.min(5, Math.max(0, metadata.rating))));
       }
     }
+
+    // Show burst group size if available (from media_index)
+    // 📸 N★ = group has reviewed favorites (no action needed)
+    // 📸 N  = group reviewed but no favorites picked yet (consider burst panel)
+    if (this.config.metadata.show_burst_info && metadata.burst_count > 1) {
+      let hasFavorites = false;
+      if (typeof metadata.burst_has_favorites === 'boolean') {
+        hasFavorites = metadata.burst_has_favorites;
+      } else if (metadata.burst_favorites) {
+        try {
+          const favs = typeof metadata.burst_favorites === 'string'
+            ? JSON.parse(metadata.burst_favorites)
+            : metadata.burst_favorites;
+          hasFavorites = Array.isArray(favs) && favs.length > 0;
+        } catch {
+          hasFavorites = false;
+        }
+        // Cache the normalized boolean so repeated renders skip re-parsing.
+        metadata.burst_has_favorites = hasFavorites;
+      }
+      parts.push(`📸 ${metadata.burst_count}${hasFavorites ? '★' : ''}`);
+    }
     
     // Show geocoded location if available (from media_index)
     if (this.config.metadata.show_location) {
-      if (metadata.location_city || metadata.location_country) {
+      if (metadata.location_city || metadata.location_country || metadata.location_country_code || metadata.location_name) {
         // Get server's country from Home Assistant config (ISO code like "US")
         const serverCountryCode = this.hass?.config?.country || null;
         
@@ -7376,16 +11803,19 @@ class MediaCard extends LitElement {
           locationText += locationText ? `, ${metadata.location_state}` : metadata.location_state;
         }
         
-        // Only show country if we have a server country AND it doesn't match
+        // Only show country if we have a server country AND it doesn't match.
+        // Fall back to location_country_code (ISO code) when location_country full name is absent.
         // Compare ISO code and all country name variations
-        if (metadata.location_country) {
+        const countryDisplay = metadata.location_country || metadata.location_country_code;
+        if (countryDisplay) {
           const countryMatches = serverCountryCode && (
-            metadata.location_country === serverCountryCode ||
-            (serverCountryNames && serverCountryNames.includes(metadata.location_country))
+            countryDisplay === serverCountryCode ||
+            metadata.location_country_code === serverCountryCode ||
+            (serverCountryNames && serverCountryNames.includes(countryDisplay))
           );
           
           if (!countryMatches) {
-            locationText += locationText ? `, ${metadata.location_country}` : metadata.location_country;
+            locationText += locationText ? `, ${countryDisplay}` : countryDisplay;
           }
         }
         
@@ -7395,6 +11825,9 @@ class MediaCard extends LitElement {
           // Has GPS but no city/state/country text yet - geocoding pending
           parts.push(`📍 Loading location...`);
         }
+      } else if (metadata.has_coordinates) {
+        // Has GPS coordinates but no geocoded location data yet — geocoding pending
+        parts.push(`📍 Loading location...`);
       }
     }
     
@@ -7444,8 +11877,15 @@ class MediaCard extends LitElement {
       ? `${label} ${stateText}${unit}` 
       : `${stateText}${unit}`;
 
-    // Icon support
-    const icon = entityConfig?.icon;
+    // Icon support (with template evaluation)
+    let icon = entityConfig?.icon;
+    // Check if icon was evaluated from a template
+    if (icon && typeof icon === 'string' && (icon.includes('{{') || icon.includes('{%'))) {
+      const iconCacheKey = `${entityId}:icon`;
+      if (this._entityStyleCache?.has(iconCacheKey)) {
+        icon = this._entityStyleCache.get(iconCacheKey);
+      }
+    }
     const baseIconColor = entityConfig?.icon_color || 'currentColor';
 
     // Evaluate JavaScript/Jinja2 styles (returns { containerStyles, iconColor })
@@ -7616,7 +12056,9 @@ class MediaCard extends LitElement {
     
     // Check individual button enable flags (default: true)
     const config = this.config.action_buttons || {};
-    const enablePause = config.enable_pause !== false;
+    // In single-media mode there is no auto-advance slideshow, so pause is irrelevant.
+    const isSingleMedia = this.config.media_source_type === 'single_media';
+    const enablePause = !isSingleMedia && config.enable_pause !== false;
     const enableFavorite = config.enable_favorite !== false;
     const enableDelete = config.enable_delete !== false;
     const enableEdit = config.enable_edit !== false;
@@ -7640,9 +12082,22 @@ class MediaCard extends LitElement {
     // Show button if enabled and queue has items (or still loading)
     const showQueueButton = enableQueuePreview && this.navigationQueue && this.navigationQueue.length >= 1;
     
+    // Mute button: hide when media is image-only.
+    // For single-media mode, use the actual file extension of the current item so the
+    // button is hidden when showing an image even if media_type was not explicitly set.
+    // For slideshow modes, fall back to the config media_type filter.
+    const mediaType = this.config.media_type || 'all';
+    const showMuteButton = isSingleMedia
+      ? MediaUtils.detectFileType(this._currentMediaPath || '') === 'video'
+      : mediaType !== 'image';
+    
     // Don't render anything if all buttons are disabled
-    const anyButtonEnabled = enablePause || enableDebugButton || enableRefresh || enableFullscreen || 
-                            (showMediaIndexButtons && (enableFavorite || enableDelete || enableEdit || enableInfo || enableBurstReview || enableRelatedPhotos || enableOnThisDay)) ||
+    const enableCast = this.config?.show_cast_button === true;
+    const enableFilterPicker = this.config?.show_filter_button === true &&
+                               this.config.media_source_type !== 'single_media';
+    const isFilterActive = !!this._sessionOverride;
+    const anyButtonEnabled = enablePause || showMuteButton || enableDebugButton || enableRefresh || enableFullscreen || enableFilterPicker ||
+                            (showMediaIndexButtons && (enableFavorite || enableDelete || enableEdit || enableInfo || enableBurstReview || enableRelatedPhotos || enableOnThisDay || enableCast)) ||
                             showQueueButton;
     if (!anyButtonEnabled) {
       return html``;
@@ -7660,15 +12115,29 @@ class MediaCard extends LitElement {
     const isOnThisDayActive = this._panelMode === 'on_this_day';
     const isQueueActive = this._panelMode === 'queue';
     const position = config.position || 'top-right';
+    
+    // V5.6.12: Mute button shows anticipated state (what WILL happen to next video)
+    const isMuted = this._getEffectiveMuteState();
 
     return html`
       <div class="action-buttons action-buttons-${position} ${this._showButtonsExplicitly ? 'show-buttons' : ''}">
         ${enablePause ? html`
           <button
-            class="action-btn pause-btn ${isPaused ? 'paused' : ''}"
+            class="action-btn pause-btn ${isPaused ? 'paused' : ''} ${isPaused && this._groupPaused ? 'group-paused' : ''}"
             @click=${this._handlePauseClick}
-            title="${isPaused ? 'Resume' : 'Pause'}">
+            @pointerdown=${this._handlePausePointerDown}
+            @pointerup=${this._handlePausePointerUp}
+            @pointercancel=${this._handlePausePointerUp}
+            title="${isPaused ? (this._groupPaused ? 'Resume Group' : 'Resume') : 'Pause'}">
             <ha-icon icon="${isPaused ? 'mdi:play' : 'mdi:pause'}"></ha-icon>
+          </button>
+        ` : ''}
+        ${showMuteButton ? html`
+          <button
+            class="action-btn mute-btn ${isMuted ? 'muted' : ''}"
+            @click=${this._handleMuteToggle}
+            title="${isMuted ? 'Unmute Videos' : 'Mute Videos'}">
+            <ha-icon icon="${isMuted ? 'mdi:volume-off' : 'mdi:volume-high'}"></ha-icon>
           </button>
         ` : ''}
         ${enableDebugButton ? html`
@@ -7682,8 +12151,32 @@ class MediaCard extends LitElement {
         ${enableRefresh ? html`
           <button
             class="action-btn refresh-btn"
+            @pointerdown=${() => {
+              // Clear stale state from any prior hold that did not emit click
+              // (e.g. pointer canceled or released off-target).
+              this._refreshHoldFired = false;
+              if (this.config?.media_source_type === 'folder') {
+                this._refreshHoldTimer = setTimeout(() => {
+                  this._refreshHoldFired = true;
+                  this._refreshHoldTimer = null;
+                  this._handleRefreshHold();
+                }, 600);
+              }
+            }}
+            @pointerup=${() => {
+              if (this._refreshHoldTimer) {
+                clearTimeout(this._refreshHoldTimer);
+                this._refreshHoldTimer = null;
+              }
+            }}
+            @pointercancel=${() => {
+              if (this._refreshHoldTimer) {
+                clearTimeout(this._refreshHoldTimer);
+                this._refreshHoldTimer = null;
+              }
+            }}
             @click=${this._handleRefreshClick}
-            title="Refresh">
+            title="${this.config?.media_source_type === 'folder' ? 'Tap: reload image · Hold: rebuild queue' : 'Refresh'}">
             <ha-icon icon="mdi:refresh"></ha-icon>
           </button>
         ` : ''}
@@ -7759,6 +12252,22 @@ class MediaCard extends LitElement {
             <ha-icon icon="mdi:delete-outline"></ha-icon>
           </button>
         ` : ''}
+        ${showMediaIndexButtons && this.config?.show_cast_button === true ? html`
+          <button
+            class="action-btn cast-btn ${this._castEntityId ? 'active' : ''}"
+            @click=${this._handleCastButtonClick}
+            title="${this._castEntityId ? `Casting to ${this._castEntityId} (tap to stop)` : 'Cast to TV'}">
+            <ha-icon icon="${this._castEntityId ? 'mdi:cast-connected' : 'mdi:cast'}"></ha-icon>
+          </button>
+        ` : ''}
+        ${enableFilterPicker ? html`
+          <button
+            class="action-btn filter-btn ${isFilterActive ? 'active' : ''}"
+            @click=${this._handleFilterPickerClick}
+            title="${isFilterActive ? 'Override Active — Tap to Edit' : 'Filter & Playback'}">
+            <ha-icon icon="${isFilterActive ? 'mdi:filter-settings' : 'mdi:filter-outline'}"></ha-icon>
+          </button>
+        ` : ''}
       </div>
     `;
   }
@@ -7810,8 +12319,20 @@ class MediaCard extends LitElement {
     const currentIndex = this.navigationIndex;
     const currentPosition = currentIndex + 1;
     
-    // Total is the max of queue length and history length
-    const totalSeen = Math.max(totalCount, this.history.length);
+    // V5.6.8: Use remembered total from previous loop if queue is being repopulated
+    // This prevents "1 of 30" showing when user saw 86 items before wrap
+    let totalSeen;
+    if (this._totalItemsInLoop && totalCount < this._totalItemsInLoop) {
+      // Queue is being repopulated after wrap - use remembered total
+      totalSeen = Math.min(this._totalItemsInLoop, this.maxNavQueueSize);
+    } else {
+      // Normal operation - use actual queue size (capped at max)
+      totalSeen = Math.min(totalCount, this.maxNavQueueSize);
+      // Update remembered total if queue grew
+      if (totalCount > (this._totalItemsInLoop || 0)) {
+        this._totalItemsInLoop = totalCount;
+      }
+    }
 
     // Show position indicator if enabled
     let positionIndicator = html``;
@@ -7853,14 +12374,18 @@ class MediaCard extends LitElement {
       return html``;
     }
 
-    // If overlay is open but we don't have full metadata, fetch it now
-    if (!this._fullMetadata && this._currentMediaPath && MediaProvider.isMediaIndexActive(this.config)) {
+    // If overlay is open but we don't have full metadata, fetch it now.
+    // Use pending path when mid-navigation so we fetch for the item being shown, not
+    // the one that is still fading out.
+    const activePath = this._pendingMediaPath || this._currentMediaPath;
+    if (!this._fullMetadata && activePath && MediaProvider.isMediaIndexActive(this.config)) {
       // Trigger async fetch (don't await, will update on next render)
       this._fetchFullMetadataAsync();
     }
 
-    // Use full metadata if available, otherwise fall back to current metadata
-    const metadata = this._fullMetadata || this._currentMetadata || {};
+    // Use full metadata if available, fall back through pending → current so the
+    // pane never shows a previous item's data while the new item is still loading.
+    const metadata = this._fullMetadata || this._pendingMetadata || this._currentMetadata || {};
     const exif = metadata.exif || {};
 
     // Format timestamp to locale date/time
@@ -7878,6 +12403,17 @@ class MediaCard extends LitElement {
       if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
       return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
     };
+
+    // Compute a friendly orientation label
+    const orientMap = { 'normal': 'Normal', '90_cw': 'Rotated 90° CW', '90_ccw': 'Rotated 90° CCW', '180': 'Rotated 180°' };
+    let orientLabel = null;
+    if (metadata.orientation) {
+      orientLabel = orientMap[metadata.orientation] || metadata.orientation;
+    } else if (metadata.width && metadata.height) {
+      if (metadata.width === metadata.height) orientLabel = 'Square';
+      else if (metadata.width > metadata.height) orientLabel = 'Landscape';
+      else orientLabel = 'Portrait';
+    }
 
     return html`
       <div class="info-overlay">
@@ -8017,12 +12553,6 @@ class MediaCard extends LitElement {
                 <div class="info-value">${exif.white_balance}</div>
               </div>
             ` : ''}
-            ${metadata.orientation ? html`
-              <div class="info-section">
-                <div class="info-label">Orientation:</div>
-                <div class="info-value">${metadata.orientation}</div>
-              </div>
-            ` : ''}
             
             <div class="info-group-header">📁 File Info</div>
             ${metadata.file_size ? html`
@@ -8059,6 +12589,12 @@ class MediaCard extends LitElement {
               <div class="info-section">
                 <div class="info-label">Dimensions:</div>
                 <div class="info-value">${metadata.width} × ${metadata.height}</div>
+              </div>
+            ` : ''}
+            ${orientLabel ? html`
+              <div class="info-section">
+                <div class="info-label">Orientation:</div>
+                <div class="info-value">${orientLabel}</div>
               </div>
             ` : ''}
             ${metadata.last_scanned ? html`
@@ -8156,6 +12692,7 @@ class MediaCard extends LitElement {
         this._lastConditionEvalTs = Date.now();
         this._pendingConditionEval = null;
         this._evaluateAllConditions();
+        this._evaluateAllEntityStyles(); // Re-evaluate styles and icon templates
         this.requestUpdate();
       };
 
@@ -8252,7 +12789,7 @@ class MediaCard extends LitElement {
         });
       });
     } catch (error) {
-      console.warn('[MediaCard] Failed to evaluate entity condition:', condition, error);
+      console.warn('[MediaViewerCard] Failed to evaluate entity condition:', condition, error);
       return false;
     }
   }
@@ -8304,7 +12841,7 @@ class MediaCard extends LitElement {
         }
       });
     } catch (error) {
-      console.warn('[MediaCard] Failed to evaluate entity styles:', error);
+      console.warn('[MediaViewerCard] Failed to evaluate entity styles:', error);
     }
     
     return { containerStyles: styles.join('; '), iconColor };
@@ -8317,32 +12854,54 @@ class MediaCard extends LitElement {
     
     for (const entityConfig of entities) {
       const entityId = typeof entityConfig === 'string' ? entityConfig : entityConfig.entity;
-      if (!entityId || !entityConfig.styles) continue;
+      if (!entityId) continue;
       
       const state = this.hass.states[entityId];
       if (!state) continue;
       
-      // Evaluate each Jinja2 style property and cache individually
-      for (const [property, template] of Object.entries(entityConfig.styles)) {
-        if (typeof template === 'string') {
-          if (template.includes('[[[') && template.includes(']]]')) {
-            // JavaScript template - skip (evaluated synchronously on render)
-            continue;
-          } else if (template.includes('{{') || template.includes('{%')) {
-            // Jinja2 template - evaluate async and cache per property
-            try {
-              const value = await this._evaluateJinjaTemplate(template);
-              const cacheKey = `${entityId}:${property}`;
-              if (!this._entityStyleCache) {
-                this._entityStyleCache = new Map();
-              }
-              this._entityStyleCache.set(cacheKey, value);
-              this._log('🎨 Jinja2 style:', property, '→', value, 'for', entityId);
-            } catch (error) {
-              console.warn('[MediaCard] Failed to evaluate Jinja2 style:', property, error);
+      // Skip if entityConfig is not an object (could be a string entity ID)
+      if (typeof entityConfig !== 'object' || entityConfig === null) continue;
+      
+      // Evaluate icon template if present
+      if (entityConfig.icon && typeof entityConfig.icon === 'string') {
+        if (entityConfig.icon.includes('{{') || entityConfig.icon.includes('{%')) {
+          try {
+            const iconValue = await this._evaluateJinjaTemplate(entityConfig.icon);
+            const cacheKey = `${entityId}:icon`;
+            if (!this._entityStyleCache) {
+              this._entityStyleCache = new Map();
             }
+            this._entityStyleCache.set(cacheKey, iconValue);
+            this._log('🎨 Jinja2 icon:', iconValue, 'for', entityId);
+          } catch (error) {
+            console.warn('[MediaViewerCard] Failed to evaluate icon template:', error);
           }
-          // Static values don't need caching
+        }
+      }
+      
+      // Evaluate each Jinja2 style property and cache individually
+      if (entityConfig.styles) {
+        for (const [property, template] of Object.entries(entityConfig.styles)) {
+          if (typeof template === 'string') {
+            if (template.includes('[[[') && template.includes(']]]')) {
+              // JavaScript template - skip (evaluated synchronously on render)
+              continue;
+            } else if (template.includes('{{') || template.includes('{%')) {
+              // Jinja2 template - evaluate async and cache per property
+              try {
+                const value = await this._evaluateJinjaTemplate(template);
+                const cacheKey = `${entityId}:${property}`;
+                if (!this._entityStyleCache) {
+                  this._entityStyleCache = new Map();
+                }
+                this._entityStyleCache.set(cacheKey, value);
+                this._log('🎨 Jinja2 style:', property, '→', value, 'for', entityId);
+              } catch (error) {
+                console.warn('[MediaViewerCard] Failed to evaluate Jinja2 style:', property, error);
+              }
+            }
+            // Static values don't need caching
+          }
         }
       }
     }
@@ -8377,7 +12936,7 @@ class MediaCard extends LitElement {
         });
       });
     } catch (error) {
-      console.warn('[MediaCard] Failed to evaluate Jinja2 template:', template, error);
+      console.warn('[MediaViewerCard] Failed to evaluate Jinja2 template:', template, error);
       return null;
     }
   }
@@ -8470,7 +13029,7 @@ class MediaCard extends LitElement {
   }
   
   // V4: Action Button Handlers
-  async _handleFavoriteClick(e) {
+  async _handleFavoriteClick(e, currentStateOverride = undefined) {
     e.stopPropagation();
     
     // Restart timer on touch (gives user full time to choose next action)
@@ -8480,11 +13039,16 @@ class MediaCard extends LitElement {
     
     if (!this._currentMediaPath || !MediaProvider.isMediaIndexActive(this.config)) return;
     
-    // CRITICAL: Capture current state NOW before async operations
+    // CRITICAL: Capture current state NOW before async operations.
+    // currentStateOverride lets callers (e.g. thumbnail click) pass the already-computed
+    // isFavorited value so we use the same multi-source check as the ♥ badge display
+    // rather than falling back to the local metadata/burst-file checks used below.
     const targetUri = this._currentMediaPath;
-    const isFavorite = this._currentMetadata?.is_favorited || 
-                       (this._burstFavoritedFiles && this._burstFavoritedFiles.includes(targetUri)) ||
-                       false;
+    const isFavorite = currentStateOverride !== undefined
+      ? currentStateOverride
+      : (this._currentMetadata?.is_favorited || 
+         (this._burstFavoritedFiles && this._burstFavoritedFiles.includes(targetUri)) ||
+         false);
     const newState = !isFavorite;
     
     this._log(`💗 FAVORITE CAPTURE: uri="${targetUri}", current_is_favorited=${isFavorite}, new_state=${newState}`);
@@ -8515,11 +13079,20 @@ class MediaCard extends LitElement {
       // Update current metadata
       if (this._currentMetadata) {
         this._currentMetadata.is_favorited = newState;
+        // When un-favoriting, clear any residual rating so the metadata header doesn't
+        // fall through to the stars branch (rating > 0) instead of showing nothing.
+        // This is in-memory only — it does not write rating=0 to the database.
+        if (!newState && this._currentMetadata.rating >= 4) {
+          this._currentMetadata.rating = null;
+        }
       }
       
       // Update panel queue item if in panel mode
       if (this._panelOpen && this._panelQueue[this._panelQueueIndex]) {
         this._panelQueue[this._panelQueueIndex].is_favorited = newState;
+        if (!newState && this._panelQueue[this._panelQueueIndex].rating >= 4) {
+          this._panelQueue[this._panelQueueIndex].rating = null;
+        }
       }
       
       // If in burst mode AND favoriting (not unfavoriting), track for burst metadata
@@ -8573,24 +13146,105 @@ class MediaCard extends LitElement {
   }
 
   // V4: Handle pause button click
+  // Short press = local pause/resume only (no broadcast to sync group).
+  // Long press (via _handlePausePointerDown) = group pause/resume (broadcasts).
   _handlePauseClick(e) {
     e.stopPropagation();
-    
+
     // Restart timer on touch (gives user full time to choose next action)
     if (this._showButtonsExplicitly) {
       this._startActionButtonsHideTimer();
     }
-    
-    this._setPauseState(!this._isPaused);
-    
-    // Stop timer when pausing, restart when resuming
-    if (this._isPaused) {
+
+    // Long press already handled group pause — absorb the click that follows
+    if (this._pauseLongPressed) {
+      this._pauseLongPressed = false;
+      return;
+    }
+
+    const wasPaused = this._isPaused;
+    this._setPauseState(!wasPaused);
+
+    const videoEl = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+    if (!wasPaused) {
+      // Short press PAUSE — local only, no broadcast
+      this._groupPaused = false;
       this._pauseTimer();
-      this._log('🎮 PAUSED slideshow - timer stopped');
+      // Also pause video element; suppress _onVideoPause side-effects
+      // (_castSyncPausing guard prevents setting _videoUserInteracted / group broadcast)
+      if (videoEl && !videoEl.paused) {
+        this._castSyncPausing = true;
+        videoEl.pause();
+      }
+      // Pause Roku cast if active
+      this._sendCastPlayToggle();
+      this._log('🎮 PAUSED locally - timer stopped (short press, no broadcast)');
+    } else {
+      // RESUME — also resume video element if paused and not ended
+      if (videoEl && videoEl.paused && !videoEl.ended) {
+        videoEl.play().catch(() => {});
+      }
+      // Resume Roku cast if active
+      this._sendCastPlayToggle();
+      if (this._groupPaused) {
+        // Was group-paused: broadcast resume so all cards resume
+        this._groupPaused = false;
+        this._resumeTimer();
+        this._log('▶️ RESUMED slideshow — broadcasting group resume');
+        this._writeSharedQueueState(true);
+      } else {
+        // Was locally paused: resume locally, no broadcast
+        // Timer restart will naturally resync with the leader on next advance
+        this._resumeTimer();
+        this._log('▶️ RESUMED locally - resyncing to group state');
+      }
+    }
+  }
+
+  // Pointer handlers for the pause button to detect long press (group pause)
+  _handlePausePointerDown(e) {
+    e.stopPropagation(); // prevent card-level hold_action from firing
+    if (!this.config?.shared_queue_id) return; // group pause only relevant for sync groups
+    this._pauseLongPressed = false;
+    this._pauseHoldTimer = setTimeout(() => {
+      this._pauseHoldTimer = null;
+      this._pauseLongPressed = true;
+      this._handleGroupPause();
+    }, 600);
+  }
+
+  _handlePausePointerUp(e) {
+    e.stopPropagation();
+    if (this._pauseHoldTimer) {
+      clearTimeout(this._pauseHoldTimer);
+      this._pauseHoldTimer = null;
+    }
+  }
+
+  // Long press on pause button: toggle group pause state and broadcast to all cards
+  _handleGroupPause() {
+    const nowGroupPaused = !this._groupPaused;
+    this._groupPaused = nowGroupPaused;
+    this._setPauseState(nowGroupPaused);
+    const videoEl = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+    if (nowGroupPaused) {
+      this._pauseTimer();
+      if (videoEl && !videoEl.paused) {
+        this._castSyncPausing = true; // suppress _onVideoPause side-effects
+        videoEl.pause();
+      }
+      this._sendCastPlayToggle();
+      this._log('🔒 Group PAUSED — broadcasting to sync group');
     } else {
       this._resumeTimer();
-      this._log('▶️ RESUMED slideshow - timer restarted');
+      if (videoEl && videoEl.paused && !videoEl.ended) {
+        videoEl.play().catch(() => {});
+      }
+      this._sendCastPlayToggle();
+      this._log('🔓 Group RESUMED — broadcasting to sync group');
     }
+    this._writeSharedQueueState(true);
+    this.requestUpdate();
   }
   
   // Handle debug button click - toggle debug mode dynamically
@@ -8617,69 +13271,76 @@ class MediaCard extends LitElement {
     this.dispatchEvent(event);
     
     const status = this._debugMode ? 'ENABLED' : 'DISABLED';
-    console.log(`🐛 [MediaCard] Debug mode ${status} - will persist across reloads`);
-    console.log(`🐛 [MediaCard] Persisted config.debug_mode:`, this.config.debug_mode);
+    console.log(`🐛 [MediaViewerCard] Debug mode ${status} - will persist across reloads`);
+    console.log(`🐛 [MediaViewerCard] Persisted config.debug_mode:`, this.config.debug_mode);
     
     // Force re-render to update button visual state
     this.requestUpdate();
   }
   
   // Handle refresh button click - reload current media
-  async _handleRefreshClick(e) {
-    e.stopPropagation();
-    
-    // Restart timer on touch (gives user full time to choose next action)
-    if (this._showButtonsExplicitly) {
-      this._startActionButtonsHideTimer();
-    }
-    
-    this._log('🔄 Refresh button clicked');
-    
-    // Check if in folder mode - if so, trigger full queue refresh
-    if (this.config?.media_source_type === 'folder') {
-      this._log('🔄 Folder mode detected - triggering full queue refresh');
-      await this._refreshQueue();
-      return;
-    }
-    
-    // Single media mode - reload current media URL
-    this._log('🔄 Single media mode - reloading current media');
-    
-    // Get the current media content ID
+  // Shared helper: evict cached URL and force-reload the currently displayed image/video.
+  // Used by both tap-refresh and after queue-refresh.
+  async _refreshCurrentImage() {
     const currentMediaId = this.currentMedia?.media_content_id || this._currentMediaPath;
-    
     if (!currentMediaId) {
       this._log('⚠️ No current media to refresh');
       return;
     }
-    
-    try {
-      // Re-resolve the media URL to get a fresh authSig and cache-busting timestamp
-      this._log('🔄 Re-resolving media URL:', currentMediaId);
-      await this._resolveMediaUrl();
-      
-      // Add cache-busting timestamp to force browser reload
-      // Note: _resolveMediaUrl already adds timestamp if auto_refresh_seconds > 0,
-      // but we force it here regardless of config for manual refresh
-      if (this.config?.auto_refresh_seconds > 0) {
-        // Already has timestamp from _resolveMediaUrl, don't add duplicate
-        this._log('Cache-busting timestamp already added by _resolveMediaUrl');
-      } else {
-        // No auto-refresh configured, add timestamp now
-        const timestampedUrl = this._addCacheBustingTimestamp(this.mediaUrl, true);
-        if (timestampedUrl !== this.mediaUrl) {
-          this._log('Added cache-busting timestamp:', timestampedUrl);
-          this.mediaUrl = timestampedUrl;
-        }
-      }
-      
-      // Force reload by updating the img/video src
-      this._mediaLoadedLogged = false; // Allow load success log again
-      this.requestUpdate();
-      
-      // Refresh metadata from media_index in background so overlay stays current
-      this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+    // Evict cached authSig URL so _resolveMediaUrl fetches a brand-new one
+    const cacheKey = currentMediaId.startsWith('/media/')
+      ? 'media-source://media_source' + currentMediaId
+      : currentMediaId;
+    this._thumbnailUrlCache?.delete(cacheKey);
 
+    await this._resolveMediaUrl();
+
+    // For manual refresh we still need explicit cache-busting when
+    // disable_cache_busting is enabled, because _resolveMediaUrl intentionally
+    // skips automatic timestamps in that mode.
+    const shouldForceManualTimestamp = this.config?.disable_cache_busting === true
+      || !(this.config?.auto_refresh_seconds > 0);
+    if (shouldForceManualTimestamp) {
+      const timestampedUrl = this._addCacheBustingTimestamp(this.mediaUrl, true);
+      if (timestampedUrl !== this.mediaUrl) {
+        this.mediaUrl = timestampedUrl;
+      }
+    }
+
+    this._mediaLoadedLogged = false;
+    this.requestUpdate();
+    this._refreshMetadata().catch(err => this._log('⚠️ Metadata refresh failed:', err));
+  }
+
+  // Hold action on refresh button (folder mode only): rebuild the queue to pick up new files
+  // then reload the current image.
+  async _handleRefreshHold() {
+    this._log('🔄 Refresh button held — rebuilding queue');
+    await this._refreshQueue();
+    // _refreshQueue resets to position 0 and calls _resolveMediaUrl if the first item changed.
+    // Force a reload of the current (possibly same) image regardless.
+    await this._refreshCurrentImage();
+    this._log('✅ Queue rebuilt and image refreshed');
+  }
+
+  async _handleRefreshClick(e) {
+    e.stopPropagation();
+
+    // If hold already fired, this click is the pointer-up at end of hold — ignore it.
+    if (this._refreshHoldFired) {
+      this._refreshHoldFired = false;
+      return;
+    }
+
+    // Restart timer on touch (gives user full time to choose next action)
+    if (this._showButtonsExplicitly) {
+      this._startActionButtonsHideTimer();
+    }
+
+    this._log('🔄 Refresh button tapped — reloading current image');
+
+    try {
+      await this._refreshCurrentImage();
       this._log('✅ Media refreshed successfully');
     } catch (error) {
       console.error('Failed to refresh media:', error);
@@ -8842,12 +13503,26 @@ class MediaCard extends LitElement {
     // Re-query with new window size
     await this._enterOnThisDayMode();
   }
+
+  /**
+   * V5.6.7: Handle photo date toggle for On This Day mode
+   */
+  async _handleUsePhotoDateChange(e) {
+    this._onThisDayUsePhotoDate = e.target.checked;
+    
+    // Re-query with new date source
+    await this._enterOnThisDayMode();
+  }
   
   // Helper to fetch full metadata asynchronously (called from render when overlay is open)
   async _fetchFullMetadataAsync() {
     // Prevent duplicate fetches
     if (this._fetchingMetadata) return;
     this._fetchingMetadata = true;
+    
+    // Capture path at fetch start — prefer pending path when mid-navigation so we
+    // always fetch for the item that will be displayed, not the one still fading out.
+    const targetPath = this._pendingMediaPath || this._currentMediaPath;
     
     try {
       // V5.2: Pass media_source_uri as-is to Media Index
@@ -8856,7 +13531,7 @@ class MediaCard extends LitElement {
         domain: 'media_index',
         service: 'get_file_metadata',
         service_data: {
-          media_source_uri: this._currentMediaPath
+          media_source_uri: targetPath
         },
         return_response: true
       };
@@ -8867,6 +13542,13 @@ class MediaCard extends LitElement {
       
       const response = await this.hass.callWS(wsCall);
       
+      // TOCTOU guard: discard if the card has navigated to a different item since we started
+      const stillActive = this._pendingMediaPath === targetPath || this._currentMediaPath === targetPath;
+      if (!stillActive) {
+        this._log('📊 Full metadata fetch discarded — navigated away before result returned');
+        return;
+      }
+      
       // Store full metadata and trigger re-render
       this._fullMetadata = response.response;
       this._log('📊 Auto-fetched full metadata for open info overlay:', this._fullMetadata);
@@ -8874,7 +13556,7 @@ class MediaCard extends LitElement {
       
     } catch (error) {
       console.error('Failed to auto-fetch metadata:', error);
-      this._fullMetadata = this._currentMetadata; // Fallback to basic metadata
+      this._fullMetadata = this._pendingMetadata || this._currentMetadata; // Fallback to basic metadata
       this.requestUpdate();
     } finally {
       this._fetchingMetadata = false;
@@ -8900,6 +13582,1358 @@ class MediaCard extends LitElement {
     const thumbnailUrl = await this._getMediaThumbnail(targetPath);
     
     this._showDeleteConfirmation(targetPath, thumbnailUrl, filename);
+  }
+
+  // ── Cast-to-TV handlers ────────────────────────────────────────────────────
+
+  async _handleCastButtonClick(e) {
+    e.stopPropagation();
+    if (this._castEntityId) {
+      this._stopCast();
+    } else {
+      await this._showCastPicker();
+    }
+  }
+
+  _showCastPicker() {
+    if (!this.hass) return;
+
+    const players = Object.entries(this.hass.states)
+      .filter(([id]) => id.startsWith('media_player.'))
+      .map(([id, state]) => ({
+        entity_id: id,
+        friendly_name: state.attributes?.friendly_name || id,
+        state: state.state,
+        is_roku: this.hass.entities?.[id]?.platform === 'roku',
+      }))
+      .sort((a, b) => {
+        // Roku devices first, then alphabetical
+        if (a.is_roku !== b.is_roku) return a.is_roku ? -1 : 1;
+        return a.friendly_name.localeCompare(b.friendly_name);
+      });
+
+    if (!players.length) return;
+
+    const dialog = document.createElement('div');
+    dialog.className = 'cast-picker-overlay';
+    dialog.innerHTML = `
+      <div class="cast-picker-content">
+        <h3 class="cast-picker-title">Cast to…</h3>
+        <div class="cast-picker-list">
+          ${players.map(p => `
+            <button class="cast-picker-item${p.is_roku ? ' cast-picker-item--roku' : ''}" data-entity="${p.entity_id}">
+              <span class="cast-picker-name">${p.friendly_name}</span>
+              <span class="cast-picker-status">${p.state}${p.is_roku ? ' · Roku' : ''}</span>
+            </button>
+          `).join('')}
+        </div>
+        <button class="cast-picker-cancel">Cancel</button>
+      </div>
+    `;
+
+    const card = this.shadowRoot.querySelector('.card');
+    card.appendChild(dialog);
+
+    const cleanup = () => dialog.remove();
+    dialog.querySelector('.cast-picker-cancel').addEventListener('click', cleanup);
+    // Tap outside the content panel to dismiss
+    dialog.addEventListener('click', e => { if (e.target === dialog) cleanup(); });
+
+    dialog.querySelectorAll('.cast-picker-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        cleanup();
+        this._castEntityId = btn.dataset.entity;
+        // Snapshot the current entity state so the first real transition in updated()
+        // is not compared against undefined (which would always look like a change).
+        this._castPrevEntityState = this.hass?.states[this._castEntityId]?.state ?? null;
+        this._castRemotePaused = false;
+        this.requestUpdate();
+        // Send immediately to launch xcast (or update if already running).
+        // Then retry after 2.5 s — if xcast was cold-starting the first send
+        // wakes it up and the retry arrives once it's ready to display content.
+        this._pushCurrentToCast();
+        setTimeout(() => this._pushCurrentToCast(), 2500);
+      });
+    });
+  }
+
+  _stopCast() {
+    const entityId = this._castEntityId;
+    const isRoku = entityId && this.hass?.entities?.[entityId]?.platform === 'roku';
+
+    this._stopCastSync();
+    this._castEntityId = null;
+    this._castPrevEntityState = null;
+    this._castRemotePaused = false;
+    // Cancel any pending pre-end pause
+    if (this._castPauseTimer) {
+      clearTimeout(this._castPauseTimer);
+      this._castPauseTimer = null;
+    }
+    this.requestUpdate();
+
+    if (isRoku && this.hass) {
+      // Tell the Roku to stop via ECP keypress/Home — returns it to the home screen
+      // so the last cast image doesn't appear frozen on the TV.
+      // We use our own backend service because the Roku HA entity does not
+      // support the generic media_player.media_stop action.
+      this.hass.callService('media_index', 'stop_cast', { roku_entity_id: entityId }).catch(() => {});
+    } else if (entityId && this.hass) {
+      // Generic DLNA/DMR player: stop via standard HA service
+      this.hass.callService('media_player', 'media_stop', { entity_id: entityId }).catch(() => {});
+    }
+  }
+
+  _stopCastSync() {
+    if (this._castSyncPoller) { clearInterval(this._castSyncPoller); this._castSyncPoller = null; }
+    if (this._castDriftPoller) { clearInterval(this._castDriftPoller); this._castDriftPoller = null; }
+    if (this._castSyncTimeout) { clearTimeout(this._castSyncTimeout); this._castSyncTimeout = null; }
+    this._stopCastEndWatch();
+  }
+
+  _stopCastEndWatch() {
+    if (this._castEndWatcher) { clearInterval(this._castEndWatcher); this._castEndWatcher = null; }
+  }
+
+  // Immediately freeze the Roku at the current frame when the user manually navigates.
+  // Without this, the old video keeps playing on the TV while the new video loads
+  // (up to ~2s), then reaches its end and shows the xcast banner before the new
+  // push arrives.  A synchronous ECP Play keypress pauses Roku instantly; the new
+  // video's push (from _onVideoCanPlay → _pushCurrentToCast) replaces it moments later.
+  _pauseCastForNavigation() {
+    if (!this._castEntityId || !this.hass) return;
+    // Only Roku supports ECP keypress — skip for DLNA/DMR and other players
+    if (this.hass.entities?.[this._castEntityId]?.platform !== 'roku') return;
+    if (this._castPauseTimer) { clearTimeout(this._castPauseTimer); this._castPauseTimer = null; }
+    this._stopCastEndWatch();
+    const wsCall = {
+      type: 'call_service', domain: 'media_index', service: 'roku_ecp_keypress',
+      service_data: { roku_entity_id: this._castEntityId, keyname: 'Play' },
+      return_response: false,
+    };
+    if (this.config.media_index?.entity_id) wsCall.target = { entity_id: this.config.media_index.entity_id };
+    this.hass.callWS(wsCall).catch(() => {});
+    this._castNavigationPauseAt = Date.now();
+    this._log(`🎬 Cast: paused for manual navigation (will resume when new video pushes)`);
+  }
+
+  // ── Runtime Filter/Playback Picker ─────────────────────────────────────────
+
+  /** Labels for blocking config fields shown in the mismatch error banner. */
+  static get _BLOCKING_FIELD_LABELS() {
+    return {
+      entity_id:    'Media Index entity',
+      folder_path:  'Folder path',
+      source_type:  'Source type',
+      media_type:   'Media type',
+      favorites:    'Favorites only',
+      date_from:    'Date from',
+      date_to:      'Date to',
+      time_from:    'Time from',
+      time_to:      'Time to',
+      auto_advance: 'Auto-advance (seconds)',
+      video_max_dur:'Video max duration',
+      video_muted:  'Video muted',
+      video_loop:   'Video loop',
+      mode:         'Play mode',
+      order_by:     'Sort by',
+      order_dir:    'Sort direction',
+    };
+  }
+
+  /**
+   * Extract only the fields that affect what media is shown and how long it plays.
+   * Used to detect config mismatches between cards sharing the same shared_queue_id.
+   * Non-blocking fields (tap actions, metadata layout, theming) are intentionally excluded.
+   */
+  _extractBlockingConfigFields(cfg) {
+    if (!cfg) return null;
+    const n = v => (v === undefined ? null : (v ?? null));
+    const timeRange = this._getTimeRangeConfig(cfg);
+    return {
+      entity_id:    n(cfg.media_index?.entity_id),
+      folder_path:  n(cfg.folder?.path),
+      source_type:  n(cfg.media_source_type),
+      media_type:   n(cfg.media_type),
+      favorites:    n(cfg.filters?.favorites),
+      date_from:    n(cfg.filters?.date_range?.start),
+      date_to:      n(cfg.filters?.date_range?.end),
+      time_from:    n(timeRange.start),
+      time_to:      n(timeRange.end),
+      auto_advance: n(cfg.auto_advance_seconds),
+      video_max_dur:n(cfg.video_max_duration),
+      video_muted:  n(cfg.video_muted),
+      video_loop:   n(cfg.video_loop),
+      mode:         n(cfg.folder?.mode),
+      order_by:     n(cfg.folder?.sequential?.order_by),
+      order_dir:    n(cfg.folder?.sequential?.order_direction),
+    };
+  }
+
+  _extractQueueScopeFields(cfg) {
+    if (!cfg) return null;
+    const n = v => (v === undefined || v === 'all' ? null : (v ?? null));
+    const timeRange = this._getTimeRangeConfig(cfg);
+    return {
+      folder_path: n(cfg.folder?.path),
+      media_type:  n(cfg.media_type),
+      date_from:   n(cfg.filters?.date_range?.start),
+      date_to:     n(cfg.filters?.date_range?.end),
+      time_from:   n(timeRange.start),
+      time_to:     n(timeRange.end),
+    };
+  }
+
+  _extractProviderScopeFields(cfg) {
+    if (!cfg) return null;
+    const n = v => (v === undefined ? null : (v ?? null));
+    return {
+      favorites: n(cfg.filters?.favorites),
+      mode:      n(cfg.folder?.mode),
+      order_by:  n(cfg.folder?.sequential?.order_by),
+      order_dir: n(cfg.folder?.sequential?.order_direction),
+    };
+  }
+
+  _getTimeRangeConfig(cfg) {
+    return {
+      start: cfg?.filters?.time_range?.start ?? cfg?.filters?.time_start ?? null,
+      end: cfg?.filters?.time_range?.end ?? cfg?.filters?.time_end ?? null
+    };
+  }
+
+  _fieldSetsDiffer(a, b) {
+    const keys = new Set([...(a ? Object.keys(a) : []), ...(b ? Object.keys(b) : [])]);
+    for (const key of keys) {
+      const av = a?.[key] ?? null;
+      const bv = b?.[key] ?? null;
+      if (String(av) !== String(bv)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _sessionOverrideChangesQueue(prevCfg, nextCfg) {
+    return this._fieldSetsDiffer(
+      this._extractQueueScopeFields(prevCfg),
+      this._extractQueueScopeFields(nextCfg)
+    );
+  }
+
+  _sessionOverrideChangesProvider(prevCfg, nextCfg) {
+    return this._fieldSetsDiffer(
+      this._extractProviderScopeFields(prevCfg),
+      this._extractProviderScopeFields(nextCfg)
+    );
+  }
+
+  _applyRuntimeConfigWithoutQueueReset() {
+    this.requestUpdate();
+    if (!this._isPaused) {
+      this._setupAutoRefresh();
+    }
+  }
+
+  _reinitProviderPreservingQueue(skipSharedQueueRestore = false) {
+    if (!this.navigationQueue?.length || this.navigationIndex < 0 || !this.currentMedia) {
+      this._reinitWithClear(skipSharedQueueRestore);
+      return;
+    }
+
+    this._fillLookaheadRunning = false;
+    this._skipSharedQueueRestore = skipSharedQueueRestore;
+    this._pendingProviderStateRestore = {
+      navigationQueue: [...this.navigationQueue],
+      navigationIndex: this.navigationIndex,
+      isNavigationQueuePreloaded: this.isNavigationQueuePreloaded,
+      maxQueueSize: this._maxQueueSize,
+      history: Array.isArray(this.history) ? [...this.history] : [],
+      historyPosition: this.historyPosition,
+      currentMedia: this.currentMedia,
+      currentMediaPath: this._currentMediaPath,
+      currentMetadata: this._currentMetadata,
+      pendingMetadata: this._pendingMetadata,
+      mediaUrl: this.mediaUrl,
+      frontLayerUrl: this._frontLayerUrl,
+      backLayerUrl: this._backLayerUrl,
+      frontLayerActive: this._frontLayerActive,
+    };
+
+    if (this.provider?.dispose) this.provider.dispose();
+    this.provider = null;
+    this._initializeProvider();
+    this.requestUpdate();
+  }
+
+  _writeVideoKeepaliveSync(reason = 'Video still playing') {
+    if (!this._hasCrossDeviceSync()) return;
+    if (Date.now() < (this._crossDeviceFollowerUntil || 0)) return;
+    this._log(`🎬 ${reason} — refreshing shared queue keepalive`);
+    this._writeSharedQueueState();
+  }
+
+  /**
+   * Compare two configFields objects. Returns array of differing entries
+   * [{key, label, mine, theirs}], or empty array if identical.
+   */
+  _diffConfigFields(mine, theirs) {
+    const labels = MediaCard._BLOCKING_FIELD_LABELS;
+    const diffs = [];
+    for (const key of Object.keys(labels)) {
+      const a = mine?.[key] ?? null;
+      const b = theirs?.[key] ?? null;
+      if (String(a) !== String(b)) {
+        diffs.push({ key, label: labels[key], mine: a, theirs: b });
+      }
+    }
+    return diffs;
+  }
+
+  /**
+   * Merge override choices onto the base config and reinitialise the provider.
+   * Call with the raw values from the picker dialog.
+   */
+  _applySessionOverride(overrides) {
+    if (!this._baseConfig) this._baseConfig = this.config;
+    this._sessionOverride = overrides;
+
+    const previousConfig = this.config;
+    const base = this._baseConfig;
+    const merged = { ...base };
+
+    // Folder path
+    if (overrides.folder_path && overrides.folder_path.trim()) {
+      merged.folder = { ...(base.folder || {}), path: overrides.folder_path.trim() };
+    } else {
+      merged.folder = base.folder ? { ...base.folder } : merged.folder;
+    }
+
+    // Mode (random / sequential)
+    if (overrides.mode) {
+      merged.folder = { ...(merged.folder || {}), mode: overrides.mode };
+    }
+
+    // Media type
+    if (overrides.media_type && overrides.media_type !== 'all') {
+      merged.media_type = overrides.media_type;
+    } else if (overrides.media_type === 'all') {
+      delete merged.media_type;
+    }
+
+    // Filters
+    const baseFilters = base.filters || {};
+    const mergedFilters = { ...baseFilters };
+    if (overrides.favorites) {
+      mergedFilters.favorites = true;
+    } else {
+      delete mergedFilters.favorites;
+    }
+    if (overrides.date_from || overrides.date_to) {
+      mergedFilters.date_range = {
+        ...(baseFilters.date_range || {}),
+        ...(overrides.date_from ? { start: overrides.date_from } : {}),
+        ...(overrides.date_to   ? { end:   overrides.date_to   } : {}),
+      };
+      if (!overrides.date_from) delete mergedFilters.date_range.start;
+      if (!overrides.date_to)   delete mergedFilters.date_range.end;
+    } else {
+      delete mergedFilters.date_range;
+    }
+    delete mergedFilters.time_start;
+    delete mergedFilters.time_end;
+    if (overrides.time_from || overrides.time_to) {
+      mergedFilters.time_range = {
+        ...(baseFilters.time_range || {}),
+        ...(overrides.time_from ? { start: overrides.time_from } : {}),
+        ...(overrides.time_to   ? { end:   overrides.time_to } : {}),
+      };
+      if (!overrides.time_from) delete mergedFilters.time_range.start;
+      if (!overrides.time_to)   delete mergedFilters.time_range.end;
+    } else {
+      delete mergedFilters.time_range;
+    }
+    merged.filters = mergedFilters;
+
+    // Video play-to-end / max duration (play_to_end takes precedence over max_duration_secs)
+    if (overrides.video_play_to_end === true || overrides.video_max_duration_secs === 0) {
+      merged.video_max_duration = 0;
+    } else if (overrides.video_max_duration_secs != null && overrides.video_max_duration_secs > 0) {
+      merged.video_max_duration = overrides.video_max_duration_secs;
+    } else if (overrides.video_play_to_end === false && base.video_max_duration !== undefined) {
+      merged.video_max_duration = base.video_max_duration;
+    } else {
+      delete merged.video_max_duration;
+    }
+
+    // Video muted
+    if (overrides.video_unmuted === true) {
+      merged.video_muted = false;
+    } else if (overrides.video_unmuted === false) {
+      merged.video_muted = true;
+    } else {
+      merged.video_muted = base.video_muted;
+    }
+
+    // Video loop
+    if (overrides.video_loop != null) {
+      // Allow explicit false to disable looping even when the base config has it on.
+      merged.video_loop = overrides.video_loop;
+    } else {
+      merged.video_loop = base.video_loop;
+    }
+
+    // Auto-advance interval
+    if (overrides.auto_advance_seconds != null && overrides.auto_advance_seconds > 0) {
+      merged.auto_advance_seconds = overrides.auto_advance_seconds;
+    } else if (overrides.auto_advance_seconds != null) {
+      delete merged.auto_advance_seconds;
+    }
+    // else: null means not provided — leave base config value unchanged
+
+    // Sequential sort options (applied when mode is sequential)
+    if (overrides.mode === 'sequential' && (overrides.sort_by || overrides.sort_direction)) {
+      merged.folder = {
+        ...(merged.folder || {}),
+        sequential: {
+          ...((base.folder?.sequential) || {}),
+          ...(overrides.sort_by        ? { order_by:        overrides.sort_by }        : {}),
+          ...(overrides.sort_direction ? { order_direction: overrides.sort_direction } : {}),
+        },
+      };
+    }
+
+    this.config = merged;
+    const queueScopeChanged = this._sessionOverrideChangesQueue(previousConfig, merged);
+    const providerScopeChanged = this._sessionOverrideChangesProvider(previousConfig, merged);
+
+    if (queueScopeChanged) {
+      // Save the sequential provider cursor before the first queue-affecting override
+      // so clearing the filter can resume from approximately the pre-filter position.
+      if (!this._preFilterCursor) {
+        this._preFilterCursor = this._getSequentialProviderCursor();
+      }
+      this._reinitWithClear(true); // skip shared-queue restore — user explicitly chose new content
+    } else if (providerScopeChanged) {
+      this._reinitProviderPreservingQueue(true);
+    } else {
+      this._applyRuntimeConfigWithoutQueueReset();
+    }
+
+    // Broadcast the new filter to all cards in the shared queue group.
+    if (!this._suppressFilterBroadcast) {
+      this._writeSharedQueueState();
+    }
+    this._suppressFilterBroadcast = false;
+  }
+
+  /** Restore the original YAML config and reinitialise the provider. */
+  _clearSessionOverride() {
+    const previousConfig = this.config;
+    const restoredConfig = this._baseConfig || this.config;
+    this.config = restoredConfig;
+    this._baseConfig = null;
+    this._sessionOverride = null;
+
+    const queueScopeChanged = this._sessionOverrideChangesQueue(previousConfig, restoredConfig);
+    const providerScopeChanged = this._sessionOverrideChangesProvider(previousConfig, restoredConfig);
+
+    if (queueScopeChanged) {
+      // Restore the pre-filter sequential cursor so the new provider queries from
+      // where we left off rather than starting at the beginning of the sequence.
+      if (this._preFilterCursor) {
+        this._pendingProviderCursor = this._preFilterCursor;
+        this._preFilterCursor = null;
+      }
+      this._reinitWithClear(true); // skip shared-queue restore — user explicitly cleared override
+    } else if (providerScopeChanged) {
+      this._reinitProviderPreservingQueue(true);
+    } else {
+      this._applyRuntimeConfigWithoutQueueReset();
+    }
+
+    // Broadcast the filter clear to all cards in the shared queue group.
+    if (!this._suppressFilterBroadcast) {
+      this._writeSharedQueueState();
+    }
+    this._suppressFilterBroadcast = false;
+  }
+
+  /** Dispose the current provider and restart from a clean navigation state. */
+  _reinitWithClear(skipSharedQueueRestore = false) {
+    // Navigation state
+    this.navigationQueue = [];
+    this.navigationIndex = -1;
+    this.isNavigationQueuePreloaded = false;
+    this._itemsSinceRefresh = 0;
+    this._fillLookaheadRunning = false; // Cancel any in-flight lookahead from the old provider
+    this._skipSharedQueueRestore = skipSharedQueueRestore;
+
+    // Display state
+    this.currentMedia = null;
+    this._currentMediaPath = null;
+    this._currentMetadata = null;
+    this._pendingMetadata = null;
+    this._pendingNavigationIndex = null;
+    this.mediaUrl = '';
+    this._frontLayerUrl = '';
+    this._backLayerUrl = '';
+
+    // Dispose provider
+    if (this.provider?.dispose) this.provider.dispose();
+    this.provider = null;
+
+    this._initializeProvider();
+    this.requestUpdate();
+  }
+
+  /** Return { lastSeenValue, lastSeenId } from the active SequentialMediaIndexProvider,
+   *  or null if the current provider is not sequential. Used to save/restore position
+   *  across a runtime filter apply/clear cycle. */
+  _getSequentialProviderCursor() {
+    if (!this.provider) return null;
+    const seqP = this.provider.constructor?.name === 'SequentialMediaIndexProvider'
+      ? this.provider
+      : (this.provider.sequentialProvider || null);
+    if (!seqP || seqP.lastSeenValue === undefined) return null;
+    return { lastSeenValue: seqP.lastSeenValue, lastSeenId: seqP.lastSeenId };
+  }
+
+  /** Open the filter/playback picker dialog. */
+  _handleFilterPickerClick(e) {
+    e.stopPropagation();
+
+    const activeOverride = this._sessionOverride || {};
+    const baseCfg = this._baseConfig || this.config;
+    const baseTimeRange = this._getTimeRangeConfig(baseCfg);
+    const currentFolder  = activeOverride.folder_path  ?? (baseCfg.folder?.path || '');
+    const currentType    = activeOverride.media_type   ?? (baseCfg.media_type || 'all');
+    const currentDateFrom = activeOverride.date_from   ?? (baseCfg.filters?.date_range?.start || '');
+    const currentDateTo  = activeOverride.date_to      ?? (baseCfg.filters?.date_range?.end   || '');
+    const currentTimeFrom = activeOverride.time_from   ?? (baseTimeRange.start || '');
+    const currentTimeTo  = activeOverride.time_to      ?? (baseTimeRange.end || '');
+    const currentFavs    = activeOverride.favorites    ?? (baseCfg.filters?.favorites === true);
+    const currentMode    = activeOverride.mode         ?? (baseCfg.folder?.mode || 'random');
+    const currentPlayToEnd = activeOverride.video_play_to_end ??
+                             (baseCfg.video_max_duration === 0 || (currentType === 'video' && baseCfg.video_max_duration == null));
+    const currentUnmuted  = activeOverride.video_unmuted ??
+                             (baseCfg.video_muted === false ? true : false);
+
+    const currentSortBy   = activeOverride.sort_by ?? (baseCfg.folder?.sequential?.order_by || 'date_taken');
+    const currentSortDir  = activeOverride.sort_direction ?? (baseCfg.folder?.sequential?.order_direction || 'desc');
+    const currentAutoAdv  = activeOverride.auto_advance_seconds ?? (baseCfg.auto_advance_seconds != null ? baseCfg.auto_advance_seconds : '');
+    const currentLoop     = activeOverride.video_loop ?? (baseCfg.video_loop === true);
+    const currentMaxDur   = activeOverride.video_max_duration_secs ?? (baseCfg.video_max_duration > 0 ? baseCfg.video_max_duration : '');
+
+    const isMediaIndex = MediaProvider.isMediaIndexActive(this.config);
+    const hideVideoSection = currentType === 'image';
+    const hideModeSection  = !isMediaIndex;
+    const hideSeqSection   = hideModeSection || currentMode !== 'sequential';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'filter-picker-overlay';
+    // Build HTML — values set programmatically below to avoid XSS
+    dialog.innerHTML = `
+      <div class="filter-picker-content">
+        <h3 class="filter-picker-title">Filter &amp; Playback</h3>
+
+        <div class="filter-picker-section">
+          <span class="filter-picker-label">Folder</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="text" class="filter-picker-input" id="fp-folder" style="flex:1"
+              placeholder="${baseCfg.folder?.path ? baseCfg.folder.path : 'Use config folder'}">
+            <button id="fp-browse-btn" class="filter-picker-browse-btn">Browse</button>
+          </div>
+        </div>
+
+        <div class="filter-picker-section">
+          <span class="filter-picker-label">Media Type</span>
+          <div class="filter-picker-radio-group" id="fp-media-type">
+            <label class="filter-picker-radio-label"><input type="radio" name="fp-mt" value="all"> All</label>
+            <label class="filter-picker-radio-label"><input type="radio" name="fp-mt" value="image"> Images</label>
+            <label class="filter-picker-radio-label"><input type="radio" name="fp-mt" value="video"> Videos</label>
+          </div>
+        </div>
+
+        <div class="filter-picker-section">
+          <span class="filter-picker-label">Date Range</span>
+          <div class="filter-picker-date-row">
+            <input type="date" class="filter-picker-date" id="fp-date-from">
+            <span style="color:rgba(255,255,255,0.5);font-size:12px">to</span>
+            <input type="date" class="filter-picker-date" id="fp-date-to">
+          </div>
+        </div>
+
+        <div class="filter-picker-section">
+          <span class="filter-picker-label">Time of Day</span>
+          <div class="filter-picker-date-row">
+            <input type="time" class="filter-picker-date" id="fp-time-from">
+            <span style="color:rgba(255,255,255,0.5);font-size:12px">to</span>
+            <input type="time" class="filter-picker-date" id="fp-time-to">
+          </div>
+        </div>
+
+        <div class="filter-picker-toggle-row">
+          <span class="filter-picker-label">Favorites Only</span>
+          <label class="filter-picker-toggle">
+            <input type="checkbox" id="fp-favorites">
+            <span class="filter-picker-toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="filter-picker-section" id="fp-video-section" style="${hideVideoSection ? 'display:none' : ''}">
+          <span class="filter-picker-label">Video Options</span>
+          <div class="filter-picker-toggle-row" style="margin-top:4px">
+            <span style="font-size:12px;color:rgba(255,255,255,0.7)">Play to completion</span>
+            <label class="filter-picker-toggle">
+              <input type="checkbox" id="fp-play-to-end">
+              <span class="filter-picker-toggle-slider"></span>
+            </label>
+          </div>
+          <div class="filter-picker-toggle-row" style="margin-top:6px">
+            <span style="font-size:12px;color:rgba(255,255,255,0.7)">Unmuted</span>
+            <label class="filter-picker-toggle">
+              <input type="checkbox" id="fp-unmuted">
+              <span class="filter-picker-toggle-slider"></span>
+            </label>
+          </div>
+          <div class="filter-picker-toggle-row" style="margin-top:6px">
+            <span style="font-size:12px;color:rgba(255,255,255,0.7)">Loop videos</span>
+            <label class="filter-picker-toggle">
+              <input type="checkbox" id="fp-loop">
+              <span class="filter-picker-toggle-slider"></span>
+            </label>
+          </div>
+          <div id="fp-max-dur-row" class="filter-picker-toggle-row" style="margin-top:8px;${currentPlayToEnd ? 'display:none' : ''}">
+            <span style="font-size:12px;color:rgba(255,255,255,0.7)">Max duration</span>
+            <div style="display:flex;align-items:center;gap:4px">
+              <input type="number" id="fp-max-duration" min="0" placeholder="\u221e"
+                style="width:60px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:6px;padding:3px 6px;color:white;font-size:12px;text-align:right">
+              <span style="font-size:11px;color:rgba(255,255,255,0.4)">sec</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="filter-picker-section" id="fp-mode-section" style="${hideModeSection ? 'display:none' : ''}">
+          <span class="filter-picker-label">Mode</span>
+          <div class="filter-picker-radio-group" id="fp-mode">
+            <label class="filter-picker-radio-label"><input type="radio" name="fp-mode" value="random"> Random</label>
+            <label class="filter-picker-radio-label"><input type="radio" name="fp-mode" value="sequential"> Sequential</label>
+          </div>
+        </div>
+
+        <div id="fp-seq-section" style="${hideSeqSection ? 'display:none' : ''}">
+          <div class="filter-picker-section" style="margin-top:2px">
+            <span class="filter-picker-label">Sort By</span>
+            <select id="fp-sort-by" class="filter-picker-input" style="width:100%">
+              <option value="date_taken">Date Taken (EXIF)</option>
+              <option value="filename">Filename</option>
+              <option value="path">Full Path</option>
+              <option value="modified_time">Modified Time</option>
+            </select>
+          </div>
+          <div class="filter-picker-section" style="margin-top:4px">
+            <span class="filter-picker-label">Sort Direction</span>
+            <select id="fp-sort-dir" class="filter-picker-input" style="width:100%">
+              <option value="desc">Descending (newest / Z-A first)</option>
+              <option value="asc">Ascending (oldest / A-Z first)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="filter-picker-section">
+          <span class="filter-picker-label">Auto-advance</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="number" id="fp-auto-advance" min="0" placeholder="off"
+              style="width:60px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:6px;padding:3px 6px;color:white;font-size:12px;text-align:right">
+            <span style="font-size:12px;color:rgba(255,255,255,0.45)">sec (blank = off)</span>
+          </div>
+        </div>
+
+        <div class="filter-picker-actions">
+          <button class="filter-picker-apply">Apply</button>
+          <button class="filter-picker-clear">Clear</button>
+          <button class="filter-picker-cancel">Cancel</button>
+        </div>
+      </div>
+    `;
+
+    // Set form values programmatically (safe — no user data in innerHTML above)
+    dialog.querySelector('#fp-folder').value = currentFolder;
+    dialog.querySelectorAll('[name="fp-mt"]').forEach(r => { r.checked = (r.value === currentType); });
+    dialog.querySelector('#fp-date-from').value = currentDateFrom;
+    dialog.querySelector('#fp-date-to').value   = currentDateTo;
+    dialog.querySelector('#fp-time-from').value = currentTimeFrom;
+    dialog.querySelector('#fp-time-to').value   = currentTimeTo;
+    dialog.querySelector('#fp-favorites').checked = currentFavs;
+    dialog.querySelector('#fp-play-to-end').checked = currentPlayToEnd;
+    dialog.querySelector('#fp-unmuted').checked     = currentUnmuted;
+    dialog.querySelectorAll('[name="fp-mode"]').forEach(r => { r.checked = (r.value === currentMode); });
+    dialog.querySelector('#fp-sort-by').value  = currentSortBy;
+    dialog.querySelector('#fp-sort-dir').value = currentSortDir;
+    if (currentAutoAdv !== '') dialog.querySelector('#fp-auto-advance').value = String(currentAutoAdv);
+    dialog.querySelector('#fp-loop').checked   = currentLoop;
+    if (currentMaxDur !== '') dialog.querySelector('#fp-max-duration').value  = String(currentMaxDur);
+
+    // Stop card keyboard navigation from intercepting folder text editing
+    dialog.querySelector('#fp-folder').addEventListener('keydown', e => e.stopPropagation());
+
+    // Play-to-end toggle shows/hides the max duration row
+    dialog.querySelector('#fp-play-to-end').addEventListener('change', ev => {
+      dialog.dataset.playToEndTouched = 'true';
+      const maxDurRow = dialog.querySelector('#fp-max-dur-row');
+      if (maxDurRow) maxDurRow.style.display = ev.target.checked ? 'none' : '';
+    });
+
+    dialog.querySelector('#fp-max-duration').addEventListener('input', () => {
+      dialog.dataset.playToEndTouched = 'true';
+    });
+
+    // Show/hide video section when media type radio changes
+    dialog.querySelector('#fp-media-type').addEventListener('change', ev => {
+      const videoSection = dialog.querySelector('#fp-video-section');
+      if (videoSection) videoSection.style.display = ev.target.value === 'image' ? 'none' : '';
+      if (ev.target.value === 'video' && dialog.dataset.playToEndTouched !== 'true') {
+        const playToEndToggle = dialog.querySelector('#fp-play-to-end');
+        const maxDurRow = dialog.querySelector('#fp-max-dur-row');
+        playToEndToggle.checked = true;
+        if (maxDurRow) maxDurRow.style.display = 'none';
+      }
+    });
+
+    // Show/hide sequential sort options when mode changes
+    dialog.querySelector('#fp-mode')?.addEventListener('change', ev => {
+      const seqSection = dialog.querySelector('#fp-seq-section');
+      if (seqSection) seqSection.style.display = ev.target.value === 'sequential' ? '' : 'none';
+    });
+
+    const card = this.shadowRoot.querySelector('.card');
+    card.appendChild(dialog);
+
+    // Browse button — opens folder picker overlay on top of this dialog
+    dialog.querySelector('#fp-browse-btn').addEventListener('click', () => {
+      this._openFolderPickerOverlay(card, (picked) => {
+        dialog.querySelector('#fp-folder').value = picked;
+      });
+    });
+
+    const cleanup = () => dialog.remove();
+    dialog.querySelector('.filter-picker-cancel').addEventListener('click', cleanup);
+    dialog.addEventListener('click', ev => { if (ev.target === dialog) cleanup(); });
+
+    dialog.querySelector('.filter-picker-clear').addEventListener('click', () => {
+      cleanup();
+      // This is a deliberate local user action — become the driver so the sync write
+      // goes through immediately (same treatment as the Apply handler above).
+      this._localFilterAppliedAt = Date.now();
+      this._claimDriverRole();
+      this._clearSessionOverride();
+    });
+
+    dialog.querySelector('.filter-picker-apply').addEventListener('click', () => {
+      const folder   = dialog.querySelector('#fp-folder').value.trim() || null;
+      const mt       = [...dialog.querySelectorAll('[name="fp-mt"]')].find(r => r.checked)?.value || 'all';
+      const dateFrom = dialog.querySelector('#fp-date-from').value || null;
+      const dateTo   = dialog.querySelector('#fp-date-to').value   || null;
+      const timeFrom = dialog.querySelector('#fp-time-from').value || null;
+      const timeTo   = dialog.querySelector('#fp-time-to').value   || null;
+      const favs     = dialog.querySelector('#fp-favorites').checked;
+      const playEnd  = dialog.querySelector('#fp-play-to-end').checked;
+      const unmuted  = dialog.querySelector('#fp-unmuted').checked;
+      const modeEl   = [...dialog.querySelectorAll('[name="fp-mode"]')].find(r => r.checked);
+      const mode     = modeEl?.value || null;
+      const sortBy   = dialog.querySelector('#fp-sort-by')?.value || 'date_taken';
+      const sortDir  = dialog.querySelector('#fp-sort-dir')?.value || 'desc';
+      const autoAdvRaw = dialog.querySelector('#fp-auto-advance').value;
+      const autoAdv    = autoAdvRaw !== '' ? Number(autoAdvRaw) : null;
+      const loop       = dialog.querySelector('#fp-loop').checked;
+      const maxDurRaw  = dialog.querySelector('#fp-max-duration').value;
+      const maxDur     = maxDurRaw !== '' ? Number(maxDurRaw) : null;
+      cleanup();
+      // This is a deliberate local user action — become the driver so the
+      // sync write goes through immediately and the stale-event guard below
+      // can reject any in-flight events from the previous driver.
+      this._localFilterAppliedAt = Date.now();
+      this._claimDriverRole();
+      this._applySessionOverride({
+        folder_path:             folder,
+        media_type:              mt,
+        date_from:               dateFrom,
+        date_to:                 dateTo,
+        time_from:               timeFrom,
+        time_to:                 timeTo,
+        favorites:               favs,
+        mode:                    mode,
+        sort_by:                 sortBy,
+        sort_direction:          sortDir,
+        auto_advance_seconds:    autoAdv,
+        video_play_to_end:       playEnd,
+        video_unmuted:           unmuted,
+        video_loop:              loop,
+        video_max_duration_secs: maxDur,
+      });
+    });
+  }
+
+  /**
+   * Open a folder-only browser on top of the filter picker.
+   * Uses the same media_source/browse_media WS call as the config editor.
+   * @param {HTMLElement} card  - the .card element to append the overlay to
+   * @param {Function}    onSelect - called with the chosen media_content_id string
+   */
+  async _openFolderPickerOverlay(card, onSelect) {
+    if (!this.hass) return;
+
+    // Determine a sensible start path
+    let startPath = '';
+    if (this.config.media_index?.entity_id) {
+      const entity = this.hass.states[this.config.media_index.entity_id];
+      if (entity?.attributes?.media_source_uri) startPath = entity.attributes.media_source_uri;
+      else if (entity?.attributes?.media_folder) startPath = entity.attributes.media_folder;
+    }
+    if (!startPath) startPath = (this._baseConfig || this.config).folder?.path || '';
+
+    // Build overlay (z-index 1001 to sit above the filter picker at 1000)
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);z-index:1001;display:flex;align-items:center;justify-content:center;';
+
+    const panel = document.createElement('div');
+    panel.style.cssText = 'background:rgba(20,20,20,0.96);border:1px solid rgba(255,255,255,0.14);border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,0.9);width:92%;max-width:460px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;animation:dialogSlideIn 0.2s ease;';
+
+    panel.innerHTML = `
+      <div style="padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;align-items:center;gap:10px">
+        <span id="fp-br-title" style="flex:1;font-size:14px;font-weight:600;color:rgba(255,255,255,0.9);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Loading…</span>
+        <button id="fp-br-x" style="background:none;border:none;color:rgba(255,255,255,0.45);font-size:18px;line-height:1;padding:0 2px;cursor:pointer">✕</button>
+      </div>
+      <div id="fp-br-list" style="flex:1;overflow-y:auto;padding:8px;min-height:80px"></div>
+      <div style="padding:12px 14px;border-top:1px solid rgba(255,255,255,0.1);display:flex;gap:8px">
+        <button id="fp-br-use" style="flex:1;padding:10px;border-radius:10px;border:none;background:var(--primary-color,#03a9f4);color:white;font-size:13px;font-weight:600;cursor:pointer">Use This Folder</button>
+        <button id="fp-br-cancel" style="padding:10px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.6);font-size:13px;cursor:pointer">Cancel</button>
+      </div>
+    `;
+
+    overlay.appendChild(panel);
+    card.appendChild(overlay);
+
+    const titleEl  = panel.querySelector('#fp-br-title');
+    const listEl   = panel.querySelector('#fp-br-list');
+    const useBtn   = panel.querySelector('#fp-br-use');
+    const closeBtn = panel.querySelector('#fp-br-x');
+    const cancelBtn = panel.querySelector('#fp-br-cancel');
+
+    let currentPath = startPath;
+    const historyStack = []; // [{content, path, title}]
+
+    const close = () => overlay.remove();
+    closeBtn.addEventListener('click', close);
+    cancelBtn.addEventListener('click', close);
+    overlay.addEventListener('click', ev => { if (ev.target === overlay) close(); });
+
+    useBtn.addEventListener('click', () => {
+      close();
+      onSelect(currentPath);
+    });
+
+    const fetchBrowse = (path) =>
+      this.hass.callWS({ type: 'media_source/browse_media', media_content_id: path });
+
+    const renderContent = (content, path) => {
+      currentPath = path;
+      const displayTitle = content.title || path.split('/').filter(Boolean).pop() || 'Media';
+      titleEl.textContent = displayTitle;
+      listEl.innerHTML = '';
+
+      // Back button when there is history
+      if (historyStack.length > 0) {
+        const back = document.createElement('button');
+        back.textContent = '⬅ Back';
+        back.style.cssText = 'width:100%;text-align:left;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);color:rgba(255,255,255,0.75);font-size:13px;cursor:pointer;margin-bottom:6px;display:block';
+        back.addEventListener('click', () => {
+          const prev = historyStack.pop();
+          renderContent(prev.content, prev.path);
+        });
+        listEl.appendChild(back);
+      }
+
+      const folders = (content.children || []).filter(c => c.can_expand);
+
+      if (!folders.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:20px;text-align:center;color:rgba(255,255,255,0.35);font-size:13px';
+        empty.textContent = 'No subfolders here';
+        listEl.appendChild(empty);
+        return;
+      }
+
+      folders.forEach(item => {
+        const name = item.title || item.media_content_id.split('/').filter(Boolean).pop() || item.media_content_id;
+        const btn = document.createElement('button');
+        btn.textContent = '📁 ' + name;
+        btn.title = item.media_content_id;
+        btn.style.cssText = 'width:100%;text-align:left;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.85);font-size:13px;cursor:pointer;margin-bottom:4px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:background 0.12s';
+        btn.addEventListener('mouseenter', () => { btn.style.background = 'rgba(255,255,255,0.12)'; });
+        btn.addEventListener('mouseleave', () => { btn.style.background = 'rgba(255,255,255,0.04)'; });
+        btn.addEventListener('click', async () => {
+          historyStack.push({ content, path });
+          listEl.innerHTML = '<div style="padding:20px;text-align:center;color:rgba(255,255,255,0.35);font-size:13px">Loading…</div>';
+          try {
+            const sub = await fetchBrowse(item.media_content_id);
+            renderContent(sub, item.media_content_id);
+          } catch (_) {
+            // Still let user select even if sub-browse fails
+            renderContent({ children: [], title: name }, item.media_content_id);
+          }
+        });
+        listEl.appendChild(btn);
+      });
+    };
+
+    // Initial load
+    try {
+      const content = await fetchBrowse(startPath);
+      renderContent(content, startPath);
+    } catch (_) {
+      try {
+        const root = await fetchBrowse('');
+        renderContent(root, '');
+      } catch (_2) {
+        close();
+      }
+    }
+  }
+
+  // Poll Roku via direct ECP query every second after local video ends.
+  // Advances the card when Roku finishes (or is paused by the pre-end pause).
+  // Also sends the pre-end pause itself when Roku is within 1.5s of its end,
+  // ensuring no xcast banner gap even for post-seek scenarios where the
+  // normal pre-end timer was not scheduled.
+  _startCastEndWatch(entityId, videoDuration) {
+    this._stopCastEndWatch();
+    if (!entityId || !this.hass) return;
+
+    this._log(`🎬 Cast end-watch: polling Roku via ECP until it finishes (dur=${videoDuration?.toFixed(1)}s)`);
+
+    const makeQueryCall = () => {
+      const wsCall = {
+        type: 'call_service', domain: 'media_index', service: 'roku_ecp_query',
+        service_data: { roku_entity_id: entityId }, return_response: true,
+      };
+      if (this.config.media_index?.entity_id) wsCall.target = { entity_id: this.config.media_index.entity_id };
+      return wsCall;
+    };
+
+    let consecutiveErrors = 0;
+    const doAdvance = async () => {
+      this._stopCastEndWatch();
+      this._log('🎬 Cast end-watch: Roku done — advancing to next item');
+      // Claim driver role so the HA sync write goes through even if _crossDeviceFollowerUntil
+      // is still active (set when we received a sync event from a follower card).
+      // The Roku end-watch advance is an authoritative leader action.
+      this._claimDriverRole();
+      const queueRefreshed = await this._checkForNewFiles();
+      if (!queueRefreshed) this._loadNext().catch(() => {});
+    };
+
+    this._castEndWatcher = setInterval(async () => {
+      // Bail if cast was disconnected — advance the card immediately so it isn't stuck
+      if (!this._castEntityId || this._castEntityId !== entityId) {
+        await doAdvance();
+        return;
+      }
+      // User paused the slideshow or manual navigation already started — just stop
+      if (this._isPaused || this._navigatingAway) {
+        this._stopCastEndWatch();
+        return;
+      }
+      try {
+        const resp = await this.hass.callWS(makeQueryCall());
+        const r = resp?.response ?? resp;
+        consecutiveErrors = 0;
+
+        if (r?.state === 'play') {
+          // Roku still playing — send pre-end pause if it's close to the end so the
+          // xcast banner never appears between videos (handles post-seek case where
+          // no _castPauseTimer was scheduled).
+          if (!this._castPreEndPauseSent && videoDuration > 2) {
+            const rokuRemaining = videoDuration - ((r.position_ms ?? 0) / 1000);
+            if (rokuRemaining <= 1.5) this._sendCastPreEndPause(entityId);
+          }
+          this._writeVideoKeepaliveSync('Cast still playing');
+          return; // still playing, keep waiting
+        }
+
+        // state is 'pause' (pre-end pause fired) or 'idle'/'stop' (natural end) — done
+        await doAdvance();
+      } catch (_) {
+        // ECP unavailable — give up after 5 consecutive failures to avoid stalling forever
+        if (++consecutiveErrors >= 5) await doAdvance();
+      }
+    }, 1000);
+  }
+
+  _sendCastPreEndPause(entityId) {
+    if (!entityId || !this.hass) return;
+    this._castPreEndPauseSent = true;
+    const kcall = {
+      type: 'call_service',
+      domain: 'media_index',
+      service: 'roku_ecp_keypress',
+      service_data: { roku_entity_id: entityId, keyname: 'Play' },
+      return_response: false,
+    };
+    if (this.config.media_index?.entity_id) {
+      kcall.target = { entity_id: this.config.media_index.entity_id };
+    }
+    this.hass.callWS(kcall).then(() => {
+      this._log(`🎬 Cast: ECP keypress/Play (pre-end pause) sent to ${entityId}`);
+    }).catch(() => {});
+  }
+
+  _startCastSync(entityId, duration) {
+    this._stopCastSync();
+    this._castPreEndPauseSent = false;
+    const POLL_MS = 500;
+    const TIMEOUT_MS = 10000;
+    const DRIFT_POLL_MS = 3000;
+    const DRIFT_THRESHOLD_S = 5;
+
+    const getVideo = () => this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+
+    // Pause local video immediately while Roku buffers the pushed content.
+    // Set guard flag first so _onVideoPause ignores this programmatic pause
+    // and does not set _videoUserInteracted or broadcast to sync group peers.
+    // IMPORTANT: Only set the flag (and pause) when the video is currently playing.
+    // If it is already paused (e.g. the early Roku pre-pause in _pushCurrentToCast ran
+    // first and the pause event was processed during the await ECP call), the browser
+    // will NOT fire a second pause event — _castSyncPausing would get stuck at true and
+    // permanently block remote-pause detection for the entire video.
+    const video = getVideo();
+    if (video) {
+      if (!video.paused) {
+        this._castSyncPausing = true;
+        video.pause();
+      } else {
+        this._castSyncPausing = false; // ensure clean state
+      }
+    }
+
+    // Group-pause all synced follower cards so they don't run ahead while Roku buffers.
+    // Only broadcast when the card is currently playing; if the user was already paused,
+    // followers are already paused and don't need a separate signal.
+    // forcedIsPaused=true so followers receive isPaused=true even though this casting card
+    // doesn't change its own _isPaused (which would interfere with the Roku-started check).
+    if (!this._isPaused) {
+      this._castSyncGroupPaused = true;
+      this._claimDriverRole();
+      this._writeSharedQueueState(true, true);
+    }
+
+    // Build a roku_ecp_query WS call payload (same routing pattern as roku_ecp_cast)
+    const makeQueryCall = () => {
+      const wsCall = {
+        type: 'call_service',
+        domain: 'media_index',
+        service: 'roku_ecp_query',
+        service_data: { roku_entity_id: entityId },
+        return_response: true,
+      };
+      if (this.config.media_index?.entity_id) {
+        wsCall.target = { entity_id: this.config.media_index.entity_id };
+      }
+      return wsCall;
+    };
+
+    // Safety fallback: resume local after 10s if Roku never reports 'play'
+    this._castSyncTimeout = setTimeout(() => {
+      this._log('⚠️ Cast sync: timeout — Roku did not report play within 10s, resuming local');
+      if (this._castSyncPoller) { clearInterval(this._castSyncPoller); this._castSyncPoller = null; }
+      this._castSyncTimeout = null;
+      if (this._castEntityId !== entityId) return;
+      const v = getVideo();
+      // If we group-paused followers at startup, resume them on timeout so they
+      // don't stay frozen indefinitely when Roku never starts.
+      if (this._castSyncGroupPaused) {
+        this._castSyncGroupPaused = false;
+        this._claimDriverRole();
+        this._writeSharedQueueState(true); // isPaused=false → group resume
+      }
+      if (v && !this._isPaused) v.play().catch(() => {});
+    }, TIMEOUT_MS);
+
+    // Poll every 500ms until Roku reports state = 'play'
+    this._castSyncPoller = setInterval(async () => {
+      if (this._castEntityId !== entityId) { this._stopCastSync(); return; }
+      try {
+        const resp = await this.hass.callWS(makeQueryCall());
+        const r = resp?.response ?? resp;
+        if (r?.state !== 'play') return;
+
+        // Roku is playing — stop the startup poller and safety timeout
+        clearInterval(this._castSyncPoller); this._castSyncPoller = null;
+        clearTimeout(this._castSyncTimeout); this._castSyncTimeout = null;
+        if (this._castEntityId !== entityId) return;
+
+        const v = getVideo();
+        if (!v) return;
+
+        // Snap local position to Roku if off by more than 1 second
+        const rokuPosSec = (r.position_ms ?? 0) / 1000;
+        if (Math.abs(v.currentTime - rokuPosSec) > 1) {
+          // Mark as code-driven so _onVideoSeeking does not count this as a user interaction.
+          this._suppressSeekInteraction = true;
+          v.currentTime = rokuPosSec;
+        }
+        // Clear user-interaction flag so slideshow auto-advance still works after video ends
+        this._videoUserInteracted = false;
+
+        // If the card was intentionally paused by the user when the cast started, respect
+        // that state: keep local paused and send an ECP pause to Roku so both stay in sync.
+        // The user can then press play to start both together.
+        if (this._isPaused) {
+          this._castSyncGroupPaused = false; // card was user-paused; never group-paused followers
+          this._sendCastPlayToggle(); // Roku just started playing → toggle → pauses it
+          this._log('🎬 Cast sync: card was paused — sent ECP pause to Roku to match');
+          return;
+        }
+
+        // Suppress the canplay that v.play() (and any snap of currentTime above) may fire —
+        // we don't want _onVideoCanPlay to push to cast again and reset Roku's position.
+        this._suppressCastPushOnCanplay = true;
+        // Roku is now confirmed playing the new video — clear the navigation-pause
+        // suppression window so genuine remote pauses are detected normally again.
+        this._castNavigationPauseAt = 0;
+        v.play().catch(() => {});
+        this._log(`🎬 Cast sync: Roku playing at ${rokuPosSec.toFixed(1)}s — local resumed`);
+
+        // Group-resume followers and seek all cards to the Roku start position.
+        // If we group-paused followers at startup, send a resume intent (isPaused=false)
+        // so they unpause and seek. Otherwise just broadcast the seek position alone.
+        this._claimDriverRole();
+        this._pendingSyncCastSeekPosition = rokuPosSec;
+        if (this._castSyncGroupPaused) {
+          this._castSyncGroupPaused = false;
+          this._writeSharedQueueState(true); // pauseIntent=true, isPaused=false — resume + seek
+        } else {
+          this._writeSharedQueueState(false); // seek only, no pause toggle
+        }
+
+        // Schedule pre-end pause so Roku doesn't snap to home screen when video ends.
+        // Use ECP keypress/Play directly (instant) instead of media_player.media_pause
+        // which has an ~8s HA polling lag and arrives too late to prevent the gap.
+        if (duration > 2) {
+          const remaining = Math.max(1, duration - rokuPosSec);
+          const pauseAfterMs = Math.max(500, (remaining - 0.5) * 1000);
+          this._castPauseTimer = setTimeout(() => {
+            this._castPauseTimer = null;
+            if (this._castEntityId !== entityId) return;
+            this._sendCastPreEndPause(entityId);
+          }, pauseAfterMs);
+        }
+
+        // Ongoing drift correction: poll every 3s, snap if drift > 5s
+        this._castDriftPoller = setInterval(async () => {
+          if (this._castEntityId !== entityId) {
+            clearInterval(this._castDriftPoller); this._castDriftPoller = null; return;
+          }
+          const vid = getVideo();
+          if (!vid || vid.paused) return;
+          // Skip drift correction while a new video is loading.  The poller is still
+          // running from the previous _startCastSync; if it fires before canplay on
+          // the new video it snaps currentTime and sets _suppressCastPushOnCanplay,
+          // which causes _onVideoCanPlay to return early and leaves _navigatingAway=true
+          // permanently — blocking the cast push, the timers, and the slideshow.
+          if (this._navigatingAway) return;
+          // Suppress drift correction briefly after a user-initiated seek so the poller
+          // doesn't snap the video back to the Roku's pre-seek position.
+          if (Date.now() < this._castSeekSuppressUntil) return;
+          try {
+            const driftResp = await this.hass.callWS(makeQueryCall());
+            // Re-check after the async WS call — navigation may have started
+            // during the 100-300ms round trip (async race condition).
+            if (this._navigatingAway) return;
+            const dr = driftResp?.response ?? driftResp;
+            if (dr?.state !== 'play') return;
+            const rokuPos = dr.position_ms / 1000;
+            const drift = rokuPos - vid.currentTime; // positive → Roku ahead, negative → local ahead
+            if (Math.abs(drift) > DRIFT_THRESHOLD_S) {
+              if (drift > 0) {
+                // Roku is ahead of local — pull local forward to keep up.
+                // Suppress the canplay the currentTime change will fire so we don't
+                // re-push to Roku and restart it from 0.
+                // Also suppress the seeking event so it isn't treated as a user interaction.
+                this._suppressCastPushOnCanplay = true;
+                this._suppressSeekInteraction = true;
+                vid.currentTime = rokuPos;
+                this._log(`🎬 Cast drift: snapped local +${drift.toFixed(1)}s (Roku was ahead)`);
+              } else {
+                // Local is ahead of Roku — this almost always means Roku ignored the
+                // contentPosition on a seek re-push and restarted from 0.
+                // Do NOT snap local backwards; that would undo the user's seek.
+                this._log(`🎬 Cast drift: ignoring — local is ${(-drift).toFixed(1)}s ahead of Roku (seek pending on Roku)`);
+              }
+            }
+          } catch (_) {}
+        }, DRIFT_POLL_MS);
+      } catch (err) {
+        this._log('⚠️ Cast sync poll error:', err);
+      }
+    }, POLL_MS);
+  }
+
+  async _pushCurrentToCast(seekPositionSec = null) {
+    if (!this._castEntityId || !this.hass || !this._currentMediaPath) return;
+
+    // Cancel any pre-end pause from the previous item
+    if (this._castPauseTimer) {
+      clearTimeout(this._castPauseTimer);
+      this._castPauseTimer = null;
+    }
+
+    // Record that a cast push is in progress so the hass-setter remote-pause
+    // guard can suppress false pause detections during Roku video transitions.
+    this._castNavigationPauseAt = Date.now();
+
+    const uri = this._currentMediaPath;
+    const entityId = this._castEntityId;
+    const fileType = MediaUtils.detectFileType(uri);
+    const ext = (uri.split('?')[0].split('.').pop() || '').toLowerCase();
+    const filename = uri.split('/').pop().split('?')[0];
+
+    // For Roku video on a fresh load (not a seek), pause local immediately — before the
+    // async ECP call — so there's no brief visible play during the ~300ms roundtrip.
+    // _startCastSync will resume once Roku reports it's playing.
+    // On seek re-push we skip this: the video is already playing at the right time.
+    const isRokuEarly = this.hass.entities?.[entityId]?.platform === 'roku';
+    if (isRokuEarly && fileType === 'video' && seekPositionSec === null) {
+      const vidEarly = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+      if (vidEarly && !vidEarly.paused) {
+        this._castSyncPausing = true;
+        vidEarly.pause();
+      }
+    }
+
+    // Resolve media-source:// URIs to a signed HTTP URL
+    let url = uri;
+    if (uri.startsWith('media-source://')) {
+      try {
+        const resp = await this.hass.callWS({
+          type: 'media_source/resolve_media',
+          media_content_id: uri,
+          expires: 3600,
+        });
+        if (resp?.url) url = resp.url;
+      } catch (err) {
+        this._log('⚠️ Cast: could not resolve media URL:', err);
+      }
+    }
+
+    // Detect Roku via entity registry — platform === 'roku' is set by the Roku HA integration.
+    // Using app_id presence was unreliable: LG WebOS and Chromecast entities also carry app_id.
+    const isRoku = this.hass.entities?.[entityId]?.platform === 'roku';
+
+    if (isRoku) {
+      // Roku: use media_index.roku_ecp_cast which runs the xcast ECP call server-side.
+      // Direct browser→Roku ECP is blocked by CORS; this service bypasses that.
+      // xcast (app 687485) supports both video and images with automatic orientation.
+      const castData = {
+        roku_entity_id: entityId,
+      };
+      // Identify the file using the current media URI (always up-to-date).
+      // _currentMetadata may lag a frame behind _currentMediaPath during navigation,
+      // so prefer uri directly for media-source:// items instead of relying on
+      // _currentMetadata.media_source_uri which can still point to the previous image.
+      if (uri.startsWith('media-source://')) {
+        castData.media_source_uri = uri;
+      } else if (this._currentMetadata?.path) {
+        castData.file_path = this._currentMetadata.path;
+      } else {
+        castData.path_contains = filename;
+      }
+
+      // For seek re-push: start Roku buffering from the seek position instead of the beginning.
+      // contentPosition is handled by the roku_ecp_cast service and appended to the xcast URL.
+      if (seekPositionSec !== null) {
+        castData.start_position_seconds = seekPositionSec;
+      }
+
+      // Route to the correct media_index instance (same pattern as get_random_items)
+      const wsCall = {
+        type: 'call_service',
+        domain: 'media_index',
+        service: 'roku_ecp_cast',
+        service_data: castData,
+        return_response: true,
+      };
+      if (this.config.media_index?.entity_id) {
+        wsCall.target = { entity_id: this.config.media_index.entity_id };
+      }
+
+      this._log(`🎬 Cast (Roku xcast) castData: ${JSON.stringify(castData)}`);
+      this._log(`🎬 Cast (Roku xcast) → ${entityId}: type=${fileType}, ${uri}`);
+      try {
+        const castResp = await this.hass.callWS(wsCall);
+        const r = castResp?.response ?? castResp;
+        this._log(`🎬 Cast (Roku xcast) cmd: ${r?.ecp_url_sent} → HTTP ${r?.ecp_status}`);
+      } catch (err) {
+        this._log('⚠️ Cast: roku_ecp_cast failed:', err);
+        return;
+      }
+    } else {
+      // DLNA / DMR / LG WebOS etc: proper MIME type required
+      const mimeMap = {
+        mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/x-m4v',
+        avi: 'video/x-msvideo', mkv: 'video/x-matroska', wmv: 'video/x-ms-wmv',
+        webm: 'video/webm', ogv: 'video/ogg', '3gp': 'video/3gpp',
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        gif: 'image/gif', webp: 'image/webp', heic: 'image/heic',
+        bmp: 'image/bmp', tiff: 'image/tiff', tif: 'image/tiff',
+      };
+      const mimeType = mimeMap[ext] || (fileType === 'video' ? 'video/mp4' : 'image/jpeg');
+      const serviceData = {
+        entity_id: entityId,
+        media_content_id: url,
+        media_content_type: mimeType,
+      };
+      this._log(`🎬 Cast (DMR) → ${entityId}: ${mimeType} ${uri}`);
+      try {
+        await this.hass.callService('media_player', 'play_media', serviceData);
+      } catch (err) {
+        this._log('⚠️ Cast: play_media failed:', err);
+        return;
+      }
+    }
+
+    // Roku video: use ECP sync to align local clock with Roku playback
+    if (isRoku && fileType === 'video') {
+      const duration = this._currentMetadata?.duration;
+      if (seekPositionSec !== null) {
+        // Seek re-push: do NOT call _startCastSync. It would stop the drift poller,
+        // re-pause local, poll until Roku reports play (~0s after rebuffer), and snap
+        // local position back to 0. Instead, widen the drift-suppress window so the
+        // existing drift poller doesn't correct back to Roku's initial 0s position
+        // while it buffers up to the seeked point.
+        this._castSeekSuppressUntil = Date.now() + 8000;
+      } else {
+        this._startCastSync(entityId, duration ? parseFloat(duration) : 0);
+      }
+      return;
+    }
+
+    // Non-Roku: schedule a pre-end pause so the TV doesn't snap to home screen
+    if (fileType === 'video') {
+      const duration = this._currentMetadata?.duration;
+      if (duration && parseFloat(duration) > 2) {
+        const pauseAfterMs = Math.max(500, (parseFloat(duration) - 0.5) * 1000);
+        this._castPauseTimer = setTimeout(async () => {
+          this._castPauseTimer = null;
+          if (this._castEntityId !== entityId) return;
+          try {
+            await this.hass.callService('media_player', 'media_pause', { entity_id: entityId });
+            this._log(`🎬 Cast: pre-end pause sent to ${entityId}`);
+          } catch (_) {}
+        }, pauseAfterMs);
+      }
+    }
   }
 
   // V5.2: _convertToFilesystemPath removed - Media Index v1.1.0+ accepts media_source_uri directly
@@ -8945,6 +14979,7 @@ class MediaCard extends LitElement {
     // V4 PATTERN: Use captured values, not current state
     // Detect if this is a video based on file extension
     const isVideo = /\.(mp4|webm|mov|avi|mkv)$/i.test(filename);
+    const videoThumbnailTime = this.config?.video_thumbnail_time || 1;
     
     // Construct the destination path for display
     // Use folder.path in folder mode, media_path in single_media mode
@@ -8966,11 +15001,13 @@ class MediaCard extends LitElement {
     dialog.innerHTML = `
       <div class="delete-confirmation-content">
         <h3>Delete Media?</h3>
-        ${!isVideo ? `
+        ${thumbnailUrl ? `
         <div class="delete-thumbnail">
-          ${thumbnailUrl ? `<img src="${thumbnailUrl}" alt="Preview">` : '<div style="padding: 40px; opacity: 0.5;">Loading preview...</div>'}
-        </div>
-        ` : ''}
+          ${isVideo
+            ? `<video preload="metadata" muted playsinline src="${thumbnailUrl}#t=${videoThumbnailTime}" style="width:100%;height:100%;object-fit:cover;display:block;"></video>`
+            : `<img src="${thumbnailUrl}" alt="Preview">`
+          }
+        </div>` : ''}
         <p><strong>File:</strong> ${filename}</p>
         <p><strong>Moving to:</strong> ${destinationPath}</p>
         <div class="delete-actions">
@@ -8983,6 +15020,12 @@ class MediaCard extends LitElement {
     // Add to card
     const cardElement = this.shadowRoot.querySelector('.card');
     cardElement.appendChild(dialog);
+    
+    // Prevent video preview from playing
+    if (isVideo && thumbnailUrl) {
+      const previewVideo = dialog.querySelector('.delete-thumbnail video');
+      if (previewVideo) previewVideo.addEventListener('play', () => previewVideo.pause());
+    }
     
     // Handle cancel
     const cancelBtn = dialog.querySelector('.cancel-btn');
@@ -9290,6 +15333,7 @@ class MediaCard extends LitElement {
     // V4 PATTERN: Use captured values, not current state
     // Detect if this is a video based on file extension
     const isVideo = /\.(mp4|webm|mov|avi|mkv)$/i.test(filename);
+    const videoThumbnailTime = this.config?.video_thumbnail_time || 1;
     
     // Construct the destination path for display
     // Use folder.path in folder mode, media_path in single_media mode
@@ -9306,11 +15350,13 @@ class MediaCard extends LitElement {
     dialog.innerHTML = `
       <div class="delete-confirmation-content">
         <h3>Mark for Editing?</h3>
-        ${!isVideo ? `
+        ${thumbnailUrl ? `
         <div class="delete-thumbnail">
-          <img src="${thumbnailUrl}" alt="Preview">
-        </div>
-        ` : ''}
+          ${isVideo
+            ? `<video preload="metadata" muted playsinline src="${thumbnailUrl}#t=${videoThumbnailTime}" style="width:100%;height:100%;object-fit:cover;display:block;"></video>`
+            : `<img src="${thumbnailUrl}" alt="Preview">`
+          }
+        </div>` : ''}
         <p><strong>File:</strong> ${filename}</p>
         <p><strong>Moving to:</strong> ${destinationPath}</p>
         <div class="delete-actions">
@@ -9323,6 +15369,12 @@ class MediaCard extends LitElement {
     // Add to card
     const cardElement = this.shadowRoot.querySelector('.card');
     cardElement.appendChild(dialog);
+    
+    // Prevent video preview from playing
+    if (isVideo && thumbnailUrl) {
+      const previewVideo = dialog.querySelector('.delete-thumbnail video');
+      if (previewVideo) previewVideo.addEventListener('play', () => previewVideo.pause());
+    }
     
     // Handle cancel
     const cancelBtn = dialog.querySelector('.cancel-btn');
@@ -9465,6 +15517,11 @@ class MediaCard extends LitElement {
       // Save previous panel mode to restore after burst closes
       this._previousPanelMode = this._panelMode; // Could be 'queue' or null
       
+      // V5.6.7: Save queue panel scroll position if coming from queue mode
+      if (this._panelMode === 'queue') {
+        this._previousQueuePageIndex = this._panelPageStartIndex;
+      }
+      
       // Call media_index.get_related_files service with burst mode
       const wsCall = {
         type: 'call_service',
@@ -9473,9 +15530,6 @@ class MediaCard extends LitElement {
         service_data: {
           mode: 'burst',
           media_source_uri: mediaPathSnapshot, // Use SNAPSHOT not current state
-          time_window_seconds: 15, // ±15 seconds for tighter burst grouping
-          prefer_same_location: true,
-          location_tolerance_meters: 20, // ~20m walking distance in 30 seconds
           sort_order: 'time_asc'
         },
         return_response: true
@@ -9525,7 +15579,8 @@ class MediaCard extends LitElement {
         await this._loadPanelItem(0);
       }
       
-      // Pause auto-advance while in burst mode
+      // V5.6.7: Save pause state before pausing, then pause auto-advance while in burst mode
+      this._previousPauseState = this._isPaused;
       if (!this._isPaused) {
         this._setPauseState(true);
       }
@@ -9561,37 +15616,57 @@ class MediaCard extends LitElement {
       // Save previous panel mode to restore after related closes
       this._previousPanelMode = this._panelMode;
       
+      // V5.6.7: Save queue panel scroll position if coming from queue mode
+      if (this._panelMode === 'queue') {
+        this._previousQueuePageIndex = this._panelPageStartIndex;
+      }
+      
       // Extract date from SNAPSHOT metadata (not current, which may have changed)
       const currentDate = metadataSnapshot?.date_taken || metadataSnapshot?.created_time;
       if (!currentDate) {
         throw new Error('No date available for current photo');
       }
       
-      // Format as YYYY-MM-DD for service call (handle string, Date object, or Unix timestamp)
-      let dateStr;
+      // Extract the LOCAL date (what user sees displayed)
+      let localDate;
       if (typeof currentDate === 'number') {
-        // Unix timestamp - convert to Date first
-        const dateObj = new Date(currentDate * 1000); // Convert seconds to milliseconds
-        dateStr = dateObj.toISOString().split('T')[0];
+        const dateObj = new Date(currentDate * 1000);
+        localDate = dateObj;
       } else if (typeof currentDate === 'string') {
-        dateStr = currentDate.split('T')[0]; // Get just the date part
+        localDate = new Date(currentDate);
       } else if (currentDate instanceof Date) {
-        dateStr = currentDate.toISOString().split('T')[0];
+        localDate = currentDate;
       } else {
-        dateStr = String(currentDate).split('T')[0];
+        localDate = new Date(String(currentDate));
       }
       
-      this._log(`📅 Using date: ${dateStr} from metadata (original: ${currentDate})`);
+      // Get start and end of the local date as Unix timestamps
+      // This ensures we match all photos from the calendar day user sees
+      const localYear = localDate.getFullYear();
+      const localMonth = localDate.getMonth();
+      const localDay = localDate.getDate();
       
-      // Call media_index.get_random_items with date filtering
+      // Start of day in local timezone (convert to Unix timestamp in seconds)
+      const startOfDay = new Date(localYear, localMonth, localDay, 0, 0, 0);
+      const startTimestamp = Math.floor(startOfDay.getTime() / 1000);
+      
+      // End of day in local timezone as inclusive Unix timestamp in seconds
+      // Use next day midnight minus 1 second to correctly handle DST transitions
+      // (days can be 23 or 25 hours during DST changes)
+      const endOfDay = new Date(localYear, localMonth, localDay + 1, 0, 0, 0);
+      const endTimestamp = Math.floor(endOfDay.getTime() / 1000) - 1;
+      
+      this._log(`📅 Same Date filter: local date ${localYear}-${String(localMonth+1).padStart(2,'0')}-${String(localDay).padStart(2,'0')} → timestamp range ${startTimestamp} to ${endTimestamp}`);
+      
+      // Call media_index.get_random_items with timestamp filtering
       const wsCall = {
         type: 'call_service',
         domain: 'media_index',
         service: 'get_random_items',
         service_data: {
           count: 100, // Get up to 100 photos from this day
-          date_from: dateStr,
-          date_to: dateStr
+          timestamp_from: startTimestamp,
+          timestamp_to: endTimestamp
         },
         return_response: true
       };
@@ -9631,7 +15706,8 @@ class MediaCard extends LitElement {
         await this._loadPanelItem(0);
       }
       
-      // Pause auto-advance while in related mode
+      // V5.6.7: Save pause state before pausing, then pause auto-advance while in related mode
+      this._previousPauseState = this._isPaused;
       if (!this._isPaused) {
         this._setPauseState(true);
       }
@@ -9664,11 +15740,15 @@ class MediaCard extends LitElement {
       
       this._panelMode = 'queue';
       this._panelOpen = true;
-      
+      // Pre-populate lookahead items so panel shows items ahead of current position
+      this._fillLookahead();
+
       // Initialize paging for queue preview
-      // V5.7: Use pending index if available (syncs with deferred navigation updates)
+      // V5.6.7: Use pending index if available (syncs with deferred navigation updates)
+      // Reset to null so the lazy init in _renderThumbnailStrip centers the current item
+      // using the actual maxDisplay value computed there.
       const currentIndex = this._pendingNavigationIndex ?? this.navigationIndex;
-      this._panelPageStartIndex = currentIndex;
+      this._panelPageStartIndex = null;
       
       // Load current item to show in panel
       const currentItem = this.navigationQueue[currentIndex];
@@ -9685,7 +15765,50 @@ class MediaCard extends LitElement {
       this.requestUpdate();
     }
   }
-  
+
+  /**
+   * Pre-populate the navigation queue ahead of the current position.
+   * Called fire-and-forget (no await) from _loadNext() and _enterQueuePreviewMode().
+   * Only active for MediaIndex providers on the queue panel.
+   */
+  _fillLookahead() {
+    if (this.isNavigationQueuePreloaded) return;
+    if (!this.provider) return;
+    if (!MediaProvider.isMediaIndexActive(this.config)) return;
+    if (this._suppressLookaheadFill) return; // skip until first _loadNext() after shared-queue restore
+    if (this._fillLookaheadRunning) return;
+    this._fillLookaheadRunning = true;
+    const capturedProvider = this.provider;
+
+    (async () => {
+      const target = (this._pendingNavigationIndex ?? this.navigationIndex) + this._lookaheadCount;
+      let added = 0;
+      let consecutiveDupes = 0;
+      while (this.navigationQueue.length < target) {
+        const item = await capturedProvider.getNext();
+        if (!item) break;
+        // Bail if the provider was replaced (e.g. a filter was applied while we were awaiting)
+        if (this.provider !== capturedProvider) break;
+        if (this.navigationQueue.some(q => q.media_content_id === item.media_content_id)) {
+          // If we've received as many consecutive duplicates as there are items in the
+          // queue, the provider has looped through its entire sequence — no new items.
+          if (++consecutiveDupes >= Math.max(this.navigationQueue.length, 1)) break;
+          continue;
+        }
+        consecutiveDupes = 0;
+        if (!item.metadata) {
+          item.metadata = await this._extractMetadataFromItem(item);
+          if (this.provider !== capturedProvider) break;
+        }
+        this.navigationQueue.push(item);
+        added++;
+      }
+      if (added > 0) this.requestUpdate();
+    })()
+      .catch(err => this._log('⚠️ _fillLookahead error:', err))
+      .finally(() => { this._fillLookaheadRunning = false; });
+  }
+
   _exitRelatedMode() {
     this._log('🚪 Exiting related photos mode');
     this._exitPanelMode();
@@ -9703,6 +15826,10 @@ class MediaCard extends LitElement {
     // Show loading state
     this._panelLoading = true;
     this._onThisDayLoading = true;
+    
+    // V5.6.7: Save pause state early before operations that might fail
+    this._previousPauseState = this._isPaused;
+    
     this.requestUpdate();
     
     try {
@@ -9713,10 +15840,35 @@ class MediaCard extends LitElement {
       // Save previous panel mode to restore after closing
       this._previousPanelMode = this._panelMode;
       
-      // Get today's month and day
-      const today = new Date();
-      const month = String(today.getMonth() + 1); // 1-12
-      const day = String(today.getDate()); // 1-31
+      // V5.6.7: Save queue panel scroll position if coming from queue mode
+      if (this._panelMode === 'queue') {
+        this._previousQueuePageIndex = this._panelPageStartIndex;
+      }
+      
+      // V5.6.7: Use photo's date or today's date based on toggle
+      // Default (off): Use today's date (for "it's my kid's birthday today")
+      // Checked (on): Use current photo's date (for "show me this birthday across years")
+      let month, day;
+      
+      if (this._onThisDayUsePhotoDate) {
+        // Use current photo's date
+        const currentTimestamp = this._currentMetadata?.date_taken || this._currentMetadata?.created_time;
+        if (!currentTimestamp) {
+          console.warn('Cannot enter On This Day mode: no timestamp for current photo');
+          this._panelLoading = false;
+          this._onThisDayLoading = false;
+          return;
+        }
+        
+        const photoDate = new Date(currentTimestamp * 1000); // Convert Unix timestamp to Date
+        month = String(photoDate.getMonth() + 1); // 1-12
+        day = String(photoDate.getDate()); // 1-31
+      } else {
+        // Use today's date (default)
+        const today = new Date();
+        month = String(today.getMonth() + 1); // 1-12
+        day = String(today.getDate()); // 1-31
+      }
       
       // Use current window setting (default 0 = exact match)
       const windowDays = this._onThisDayWindowDays || 0;
@@ -9765,6 +15917,11 @@ class MediaCard extends LitElement {
       this._panelPageStartIndex = 0; // Start at beginning
       this._panelLoading = false;
       this._onThisDayLoading = false;
+      
+      // V5.6.7: Pause auto-advance while in On This Day mode (pause state already saved earlier)
+      if (!this._isPaused) {
+        this._setPauseState(true);
+      }
       
       this.requestUpdate();
       
@@ -9831,6 +15988,7 @@ class MediaCard extends LitElement {
         const restoredItem = this.navigationQueue[this.navigationIndex];
         if (restoredItem) {
           // Properly restore display state (same as _loadNext)
+          this._clearLivePhotoPlayback();
           this.currentMedia = restoredItem;
           this._currentMediaPath = restoredItem.media_content_id;
           this._currentMetadata = restoredItem.metadata || null;
@@ -9843,11 +16001,16 @@ class MediaCard extends LitElement {
           await this._resolveMediaUrl();
           
           this._log(`↩️ Restored main queue position ${this.navigationIndex + 1}/${this.navigationQueue.length}`);
+
+          // Refresh metadata in background so header picks up any burst_count/burst_favorites
+          // written by update_burst_metadata during the panel session just closed
+          this._refreshMetadata().catch(err => this._log('⚠️ Post-panel metadata refresh failed:', err));
         }
       }
       
       // Clear panel state (but might restore queue panel below)
       const previousPanelMode = this._previousPanelMode;
+      const preservedPageStartIndex = this._panelPageStartIndex; // V5.6.7: Preserve for queue restoration
       this._panelOpen = false;
       this._panelMode = null;
       this._panelQueue = [];
@@ -9869,16 +16032,40 @@ class MediaCard extends LitElement {
       this._mainQueueIndex = 0;
       this._previousPanelMode = null;
       
+      // V5.6.7: Restore previous pause state BEFORE restoring queue panel
+      // This ensures the pause state is correct whether we restore queue or not
+      const shouldRestoreQueuePanel = (previousPanelMode === 'queue');
+      const shouldRestorePauseState = !isQueuePreview; // Don't restore when closing queue itself
+      
+      if (shouldRestorePauseState && this._previousPauseState !== null) {
+        if (!this._previousPauseState && this._isPaused) {
+          // Was not paused before, currently paused, so resume
+          this._setPauseState(false);
+          // V5.6.7: Explicitly restart auto-refresh to ensure timer is active
+          this._setupAutoRefresh();
+        }
+      }
+      // V5.6.7: Always clear saved pause state after use (not just in restore branch)
+      this._previousPauseState = null;
+      
       // Restore previous panel mode if we were in queue preview before burst
-      if (previousPanelMode === 'queue') {
+      if (shouldRestoreQueuePanel) {
         this._panelMode = 'queue';
         this._panelOpen = true;
+        // V5.6.7: Restore queue scroll position from saved value
+        if (this._previousQueuePageIndex !== null) {
+          this._panelPageStartIndex = this._previousQueuePageIndex;
+          this._previousQueuePageIndex = null; // Clear saved value
+        } else {
+          this._panelPageStartIndex = preservedPageStartIndex;
+        }
         console.warn('↩️ Restored queue preview panel after burst review');
       }
       
-      // Resume auto-advance if it was paused for panel mode (but not if we restored queue panel)
-      if (this._isPaused && this._panelMode !== 'queue') {
-        this._setPauseState(false);
+      // V5.6.7: When closing queue panel, ensure auto-refresh is active if not paused
+      if (isQueuePreview && !this._isPaused) {
+        this._log('▶️ Restarting auto-advance after closing queue panel');
+        this._setupAutoRefresh();
       }
       
       this.requestUpdate();
@@ -9906,8 +16093,81 @@ class MediaCard extends LitElement {
    */
   _isVideoItem(item) {
     if (!item) return false;
+    // V5.8: Check media_content_type first – most reliable for integration sources.
+    // Reolink/Immich items have opaque URIs with no file extension, so _isVideoFile() returns
+    // null, but browse_media returns media_class: 'video' which is stored as media_content_type.
+    if (item.media_content_type?.startsWith('video')) return true;
     const path = item.media_content_id || item.path || '';
     return this._isVideoFile(path);
+  }
+
+  /**
+   * V5.8: Check if the currently displayed item is a video, using all available signals.
+   * _isVideoFile() checks file extension but fails for Reolink (media-source://reolink/FILE|...)
+   * and other integration sources that use opaque URIs with no extension.
+   * This method also checks media_content_type (set from HA browse_media response where
+   * Reolink returns media_class='video') and the resolved mediaUrl.
+   *
+   * @param {string|null} resolvedUrl - The newly resolved URL being set. When provided (e.g.
+   *   from _setMediaUrl before this.mediaUrl is updated), this URL is used instead of the
+   *   potentially stale this.mediaUrl. Omit to use this.mediaUrl (safe once URL is current).
+   */
+  _isCurrentItemVideo(resolvedUrl = null) {
+    // Check media_content_type first – most reliable for integration sources (Reolink, Immich, etc.)
+    if (this.currentMedia?.media_content_type?.startsWith('video')) return true;
+    // Fall back to extension-based detection on the canonical ID or resolved URL.
+    // NOTE: When called from _setMediaUrl, resolvedUrl is the NEW url being set — this.mediaUrl
+    // is still the PREVIOUS item's URL at that point (stale). Always pass resolvedUrl from
+    // _setMediaUrl to avoid classifying a JPG as a video just because the previous item was an mp4.
+    return this._isVideoFile(this.currentMedia?.media_content_id) || this._isVideoFile(resolvedUrl ?? this.mediaUrl);
+  }
+
+  /**
+   * V5.8: Handle a video failure in folder mode with transient error protection.
+   *
+   * Problem: The browser fires MEDIA_ERR_SRC_NOT_SUPPORTED for ANY HTTP error on a <source>
+   * element (400, 403, 404, 500) – not just a real 404.  Reolink's NVR can return HTTP 400
+   * when it rejects concurrent download requests (e.g. when two cards pre-load the same
+   * camera stream simultaneously).  The card was treating these as "file not found" and
+   * permanently removing the items from the queue.
+   *
+   * Fix: Track consecutive failures per item.  Allow one transient skip before permanently
+   * removing.  If the error was genuinely transient (NVR busy), the retry will succeed and
+   * the counter is cleared by _onVideoCanPlay.  If the file is truly missing, it will fail
+   * twice and be permanently removed on the second attempt.
+   */
+  _handleVideoFolderFailure() {
+    const itemId = this.currentMedia?.media_content_id;
+    if (!itemId) {
+      // No item ID to track — just advance to next
+      setTimeout(() => this._loadNext(), 100);
+      return;
+    }
+
+    const THRESHOLD = 2; // Remove permanently after this many consecutive failures
+    const count = (this._videoTransientFailures.get(itemId) || 0) + 1;
+    this._videoTransientFailures.set(itemId, count);
+
+    // Prevent unbounded growth of the failure map
+    if (this._videoTransientFailures.size > 100) {
+      const firstKey = this._videoTransientFailures.keys().next().value;
+      this._videoTransientFailures.delete(firstKey);
+    }
+
+    if (count < THRESHOLD) {
+      this._log(
+        `⚠️ Video load failed (attempt ${count}/${THRESHOLD}) – skipping without permanent removal.` +
+        ` May be a transient error (e.g. Reolink NVR rejecting concurrent request with 400).`
+      );
+      setTimeout(() => this._loadNext(), 100);
+    } else {
+      this._log(
+        `🗑️ Video failed ${count} consecutive times – permanently removing from queue: ${itemId}`
+      );
+      this._videoTransientFailures.delete(itemId);
+      this._remove404FromQueues(this.currentMedia);
+      setTimeout(() => this._loadNext(), 100);
+    }
   }
   
   /**
@@ -9925,16 +16185,51 @@ class MediaCard extends LitElement {
     const videoElement = e.target;
     const cacheKey = item.media_content_id || item.path;
     
-    // Mark as loaded in cache (video element stays rendered)
+    // Mark as loaded in cache (video element stays rendered, capped at 300 entries)
     this._videoThumbnailCache.set(cacheKey, true);
-    
+    if (this._videoThumbnailCache.size > 300) {
+      this._videoThumbnailCache.delete(this._videoThumbnailCache.keys().next().value);
+    }
+
     // Mark as loaded for CSS styling
     videoElement.dataset.loaded = 'true';
   }
   
   _handleThumbnailError(e, item) {
     // Handle 404s for queue thumbnails - mark item as invalid and hide it
-    this._log('📭 Thumbnail failed to load (404):', item.filename || item.path);
+    this._log('📭 Thumbnail failed to load (404):', item?.filename || item?.media_content_id || item?.path);
+
+    // HEIC/HEIF thumbnails: the browser cannot render .heic URLs directly as <img> even though
+    // the main card converts them for display.  Treat the same as video thumbnail failures —
+    // hide the element and show a placeholder, but keep the item in the queue so the user can
+    // still navigate to it and it can be displayed via HEIC conversion in the main view.
+    const itemPath = (item?.path || item?.filename || item?.media_content_id || '').toLowerCase();
+    if (item && (itemPath.endsWith('.heic') || itemPath.endsWith('.heif'))) {
+      this._log(`⚠️ HEIC thumbnail failed to render — keeping item in queue: ${item.filename || item.path}`);
+      const target = e.target;
+      if (target) target.style.display = 'none';
+      item._thumbnailFailed = true;
+      this.requestUpdate();
+      return;
+    }
+
+    // V5.8: Never remove video items from the navigation queue on thumbnail failure.
+    // Video thumbnails can fail transiently (e.g. Reolink NVR returns 400 for concurrent requests)
+    // even when the video itself is perfectly playable. The main video error handler
+    // (_handleVideoFolderFailure) is the correct place to detect genuinely missing videos.
+    // Additionally, _isVideoItem() was previously returning false for Reolink items (opaque URIs,
+    // no file extension) so they were rendering as <img> which always fails on a video URL.
+    if (item && this._isVideoItem(item)) {
+      this._log(`⚠️ Video thumbnail failed – hiding media element but keeping container clickable: ${item.media_content_id || item.filename}`);
+      // V5.8: Hide only the <video>/<img> element itself.  The .thumbnail container must stay
+      // visible and clickable so the user can still navigate to the item via the queue panel.
+      // The emoji overlay (🎞️) will remain visible as a placeholder.
+      const target = e.target;
+      if (target) target.style.display = 'none';
+      item._thumbnailFailed = true; // V5.8: triggers text placeholder in render
+      this.requestUpdate();
+      return;
+    }
     
     // Mark the item as invalid so it won't be displayed
     if (item) {
@@ -10007,7 +16302,7 @@ class MediaCard extends LitElement {
     const target = e.target;
     if (target) {
       // Find the parent thumbnail container and hide it
-      const thumbnailContainer = target.closest('.thumbnail-item');
+      const thumbnailContainer = target.closest('.thumbnail');
       if (thumbnailContainer) {
         thumbnailContainer.style.display = 'none';
       }
@@ -10034,6 +16329,21 @@ class MediaCard extends LitElement {
     if (!itemIdentifier) {
       this._log('⚠️ Cannot remove 404 item - no identifier found');
       return;
+    }
+
+    // V5.6.8: Tell provider to exclude this file so it won't be returned again
+    // Pass all identifier formats - provider will normalize them
+    if (this.provider && typeof this.provider.excludeFile === 'function') {
+      // Exclude by path (filesystem path)
+      if (item.path) {
+        this.provider.excludeFile(item.path);
+        this._log('🚫 Excluded file from provider (path):', item.path);
+      }
+      // Also exclude by media_source_uri if different from path
+      if (item.media_source_uri && item.media_source_uri !== item.path) {
+        this.provider.excludeFile(item.media_source_uri);
+        this._log('🚫 Excluded file from provider (uri):', item.media_source_uri);
+      }
     }
 
     // Helper to match items by identifier - handle both URI and path formats
@@ -10288,6 +16598,14 @@ class MediaCard extends LitElement {
       this._startActionButtonsHideTimer();
     }
     
+    // V5.6.7: Toggle bottom overlay visibility during video playback
+    // This allows access to video controls (play/pause, seek bar, volume)
+    const isVideo = this._isVideoFile(this.mediaUrl);
+    if (isVideo) {
+      this._hideBottomOverlaysForVideo = !this._hideBottomOverlaysForVideo;
+      this._log(`🎬 Bottom overlays ${this._hideBottomOverlaysForVideo ? 'hidden' : 'shown'} for video controls access`);
+    }
+    
     this.requestUpdate();
   }
   
@@ -10348,6 +16666,27 @@ class MediaCard extends LitElement {
   }
   
   _handleDoubleTap(e) {
+    // Left/right zone double-tap on a video → seek ±10 seconds (YouTube-style)
+    // Takes priority over double_tap_action in left/right zones.
+    if (this._isVideoFile(this.mediaUrl || '')) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const xFrac = (e.clientX - rect.left) / rect.width;
+      if (xFrac < 0.35) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this._tapTimeout) { clearTimeout(this._tapTimeout); this._tapTimeout = null; }
+        this._seekVideo(-10);
+        return;
+      }
+      if (xFrac > 0.65) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this._tapTimeout) { clearTimeout(this._tapTimeout); this._tapTimeout = null; }
+        this._seekVideo(10);
+        return;
+      }
+    }
+
     if (!this.config.double_tap_action) return;
     
     // Prevent default and stop single tap
@@ -10361,20 +16700,122 @@ class MediaCard extends LitElement {
     
     this._performAction(this.config.double_tap_action);
   }
+
+  // Seek local video by deltaSeconds (negative = rewind, positive = fast-forward).
+  // When casting to Roku, re-pushes the current video with contentPosition so xcast
+  // buffers from the correct position (ECP cmd_seek is not supported by xcast).
+  _seekVideo(deltaSeconds) {
+    const video = this.shadowRoot?.querySelector('video:not(.live-photo-video)');
+    if (!video) return;
+    const newTime = Math.max(0, Math.min(video.currentTime + deltaSeconds, video.duration || Infinity));
+    video.currentTime = newTime;
+    this._log(`⏩ Seek ${deltaSeconds > 0 ? '+' : ''}${deltaSeconds}s → ${newTime.toFixed(1)}s`);
+
+    // Cancel any outstanding pre-end pause timer (based on pre-seek position) and re-arm
+    // the timeupdate fallback by clearing the sent flag — it will fire once within 0.5s of the new end.
+    if (this._castPauseTimer) { clearTimeout(this._castPauseTimer); this._castPauseTimer = null; }
+    this._castPreEndPauseSent = false;
+
+    // When casting, re-push the video starting at the seeked position so Roku buffers from here.
+    // _startCastSync (called inside _pushCurrentToCast) handles sync once Roku is playing.
+    // Set the suppress flag first so the canplay fired by video.currentTime = newTime above
+    // does not trigger a second _pushCurrentToCast without the seek position.
+    if (this._castEntityId) {
+      this._suppressCastPushOnCanplay = true;
+      this._pushCurrentToCast(newTime);
+    }
+  }
+
+  // Send ECP Play keypress (toggle pause/resume) to the active Roku cast.
+  // Called from pause button and group-pause/resume handlers to keep Roku in lockstep.
+  _sendCastPlayToggle() {
+    if (!this._castEntityId || !this.hass) return;
+    const kcall = {
+      type: 'call_service',
+      domain: 'media_index',
+      service: 'roku_ecp_keypress',
+      service_data: { roku_entity_id: this._castEntityId, keyname: 'Play' },
+      return_response: false,
+    };
+    if (this.config.media_index?.entity_id) {
+      kcall.target = { entity_id: this.config.media_index.entity_id };
+    }
+    this.hass.callWS(kcall).then(() => {
+      this._log('🎬 Cast: ECP Play (pause/resume toggle) sent');
+    }).catch(() => {});
+  }
   
   _handlePointerDown(e) {
     if (!this.config.hold_action) return;
+
+    // Don't intercept pointer events that originate inside the info overlay — the user
+    // may be trying to select/copy text, and hold-to-select would otherwise trigger navigation.
+    // Guard against Text/Comment nodes which don't have .closest().
+    if (e.target instanceof Element && e.target.closest('.info-overlay')) return;
+
+    // Prevent the browser/WebView from triggering native long-press gestures (e.g. Fully Kiosk's
+    // configured long-press action). Without this, Fully Kiosk fires pointercancel at ~460-560ms
+    // to steal the touch for its own gesture, preventing our hold timer from completing and then
+    // doing its own navigation — causing HA router state corruption and a UI lockup.
+    e.preventDefault();
     
+    this._activePointerId = e.pointerId;
+    this._log(`🖐️ PointerDown: type=${e.pointerType} id=${e.pointerId} (preventDefault called)`);
+
     // Start hold timer (500ms like standard HA cards)
     this._holdTimeout = setTimeout(() => {
+      this._log(`🖐️ Hold timer fired — executing hold_action`);
       this._performAction(this.config.hold_action);
       this._holdTriggered = true;
     }, 500);
     
     this._holdTriggered = false;
   }
+
+  _handleSwipeTouchStart(e) {
+    if (e.touches.length !== 1) return;
+    this._swipeTouchStartX = e.touches[0].clientX;
+    this._swipeTouchStartY = e.touches[0].clientY;
+  }
+
+  _handleSwipeTouchEnd(e) {
+    // Fallback: clear hold timer on touchend in case pointerup doesn't fire.
+    // This guards against edge cases in WebViews where preventDefault() on pointerdown
+    // could suppress pointerup (implementation-dependent, though not spec-compliant).
+    if (this._holdTimeout && !this._holdTriggered) {
+      clearTimeout(this._holdTimeout);
+      this._holdTimeout = null;
+    }
+
+    if (this._swipeTouchStartX === null) return;
+    const deltaX = e.changedTouches[0].clientX - this._swipeTouchStartX;
+    const deltaY = e.changedTouches[0].clientY - this._swipeTouchStartY;
+    this._swipeTouchStartX = null;
+    this._swipeTouchStartY = null;
+
+    // Require min horizontal distance and horizontal must dominate vertical
+    const SWIPE_THRESHOLD = 50;
+    if (Math.abs(deltaX) < SWIPE_THRESHOLD || Math.abs(deltaX) <= Math.abs(deltaY)) return;
+
+    // Horizontal swipe confirmed — suppress the synthetic click and hold action
+    e.preventDefault();
+    if (this._holdTimeout) {
+      clearTimeout(this._holdTimeout);
+      this._holdTimeout = null;
+    }
+
+    this._isManualNavigation = true;
+    if (deltaX > 0) {
+      // Swipe right → go back
+      this._loadPrevious();
+    } else {
+      // Swipe left → go forward
+      this._loadNext();
+    }
+  }
   
   _handlePointerUp(e) {
+    this._log(`🖐️ PointerUp: type=${e.pointerType} id=${e.pointerId} holdTriggered=${this._holdTriggered}`);
     if (this._holdTimeout) {
       clearTimeout(this._holdTimeout);
       this._holdTimeout = null;
@@ -10382,6 +16823,7 @@ class MediaCard extends LitElement {
   }
   
   _handlePointerCancel(e) {
+    this._log(`🖐️ PointerCancel: type=${e.pointerType} id=${e.pointerId}`);
     if (this._holdTimeout) {
       clearTimeout(this._holdTimeout);
       this._holdTimeout = null;
@@ -10430,7 +16872,7 @@ class MediaCard extends LitElement {
     }
   }
 
-  _showToast(message) {
+  _showToast(message, duration = 2000) {
     // V4 CODE: Simple toast notification (line 5470-5492)
     const toast = document.createElement('div');
     toast.textContent = message;
@@ -10452,7 +16894,7 @@ class MediaCard extends LitElement {
     
     setTimeout(() => {
       toast.remove();
-    }, 2000);
+    }, duration);
   }
 
   // NEW: Auto-enable kiosk mode monitoring
@@ -10643,14 +17085,33 @@ class MediaCard extends LitElement {
       console.warn('No navigation_path specified for navigate action');
       return;
     }
-    
+
+    // Dispatch a synthetic pointercancel before navigating to release active touch tracking.
+    // Without this, WebView-based browsers (e.g. Fully Kiosk) can lock up touch input after
+    // a hold-action navigate because the WebView sees pointerdown but never pointerup/cancel.
+    // Dispatching pointercancel signals the end of the pointer interaction before the DOM changes.
+    this._log(`🧭 Navigate: dispatching synthetic pointercancel before view change (pointerId=${this._activePointerId})`);
+    try {
+      const cancelEvent = new PointerEvent('pointercancel', {
+        bubbles: true,
+        cancelable: false,
+        pointerId: this._activePointerId ?? 1,
+        pointerType: 'touch',
+      });
+      this.dispatchEvent(cancelEvent);
+    } catch (err) {
+      this._log('⚠️ Could not dispatch synthetic pointercancel:', err.message);
+    }
+
     window.history.pushState(null, '', action.navigation_path);
-    const event = new Event('location-changed', {
-      bubbles: true,
-      composed: true,
-    });
-    event.detail = { replace: false };
-    this.dispatchEvent(event);
+    // Dispatch on window (not this element) — this is the standard HA navigation pattern.
+    // Dispatching on the element with bubbles:true can cause the event to be handled multiple
+    // times in some WebView implementations, leading to double-navigation.
+    window.dispatchEvent(new CustomEvent('location-changed', {
+      bubbles: false,
+      composed: false,
+      detail: { replace: false },
+    }));
   }
   
   _performUrlOpen(action) {
@@ -10870,6 +17331,12 @@ class MediaCard extends LitElement {
       max-height: 100%;
       object-fit: contain;
       transition: opacity var(--transition-duration, 300ms) ease-in-out;
+      /* Prevent Android WebView's native long-press image gesture (save/share/copy),
+         which fires pointercancel at ~500-600ms and blocks hold_action from working. */
+      -webkit-user-drag: none;
+      -webkit-touch-callout: none;
+      user-select: none;
+      -webkit-user-select: none;
     }
     
     .media-container .image-layer.active {
@@ -10880,6 +17347,24 @@ class MediaCard extends LitElement {
     .media-container .image-layer.inactive {
       opacity: 0;
       z-index: 1;
+    }
+
+    .media-container .live-photo-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center center;
+      opacity: 0;
+      z-index: 3;
+      pointer-events: none;
+      background: transparent;
+      transition: opacity 120ms ease-in-out;
+    }
+
+    .media-container .live-photo-video.ready {
+      opacity: 1;
     }
     
     /* V5.7: Edge fade effect - smooth rectangular fade using intersecting gradients */
@@ -10986,6 +17471,10 @@ class MediaCard extends LitElement {
       object-fit: cover !important;
       object-position: center center;
     }
+
+    :host([data-aspect-mode="viewport-fill"]) .media-container .live-photo-video {
+      object-fit: cover !important;
+    }
     
     :host([data-aspect-mode="smart-scale"]) .media-container {
       display: grid !important;
@@ -11075,6 +17564,21 @@ class MediaCard extends LitElement {
       object-fit: contain;
       margin: auto;
     }
+
+    /* Fixed height fill mode: image/video fills container, cropped to fit (object-fit: cover) */
+    :host([data-card-height][data-card-height-fill]:not([data-aspect-mode])) img,
+    :host([data-card-height][data-card-height-fill]:not([data-aspect-mode])) .image-layer,
+    :host([data-card-height][data-card-height-fill]:not([data-aspect-mode])) video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      object-fit: cover;
+      transform: none;
+      margin: 0;
+    }
     
     /* Default mode (no aspect-mode, no card-height): Center images and apply max-height */
     :host(:not([data-aspect-mode]):not([data-card-height])) .media-container {
@@ -11153,6 +17657,38 @@ class MediaCard extends LitElement {
       object-fit: contain;
       background: transparent;
       margin: auto;
+    }
+
+    /* V5.6.8: Hide native video controls when controls-on-tap is enabled */
+    video.hide-controls::-webkit-media-controls {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-enclosure {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-panel {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-play-button {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-timeline {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-current-time-display {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-time-remaining-display {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-mute-button {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-volume-slider {
+      display: none !important;
+    }
+    video.hide-controls::-webkit-media-controls-fullscreen-button {
+      display: none !important;
     }
 
     :host([data-aspect-mode="viewport-fit"]) .main-content video {
@@ -11423,8 +17959,19 @@ class MediaCard extends LitElement {
       transform: scale(1.05);
     }
     
+    /* V5.6.7: Preserve translateX centering on hover for center-positioned clocks */
+    .clock-overlay.clock-center-top.clickable:hover,
+    .clock-overlay.clock-center-bottom.clickable:hover {
+      transform: translateX(-50%) scale(1.05);
+    }
+    
     .clock-overlay.clickable:active {
       transform: scale(0.98);
+    }
+    
+    .clock-overlay.clock-center-top.clickable:active,
+    .clock-overlay.clock-center-bottom.clickable:active {
+      transform: translateX(-50%) scale(0.98);
     }
     
     /* Only apply backdrop-filter if opacity > 0.05 to allow true transparency */
@@ -11496,6 +18043,22 @@ class MediaCard extends LitElement {
       transform: translateX(-50%);
     }
 
+    /* V5.6.7: Hide bottom overlays during video playback (tap center to toggle)
+       This allows access to native video controls (play/pause, seek bar, volume) */
+    .media-container.hide-bottom-overlays .metadata-overlay.metadata-bottom-left,
+    .media-container.hide-bottom-overlays .metadata-overlay.metadata-bottom-right,
+    .media-container.hide-bottom-overlays .metadata-overlay.metadata-center-bottom,
+    .media-container.hide-bottom-overlays .display-entities.position-bottom-left,
+    .media-container.hide-bottom-overlays .display-entities.position-bottom-right,
+    .media-container.hide-bottom-overlays .display-entities.position-center-bottom,
+    .media-container.hide-bottom-overlays .clock-overlay.clock-bottom-left,
+    .media-container.hide-bottom-overlays .clock-overlay.clock-bottom-right,
+    .media-container.hide-bottom-overlays .clock-overlay.clock-center-bottom {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s ease;
+    }
+
     /* V4: Action Buttons (Favorite/Delete/Edit) */
     .action-buttons {
       position: absolute;
@@ -11517,6 +18080,13 @@ class MediaCard extends LitElement {
 
     /* Explicit show for touch screens */
     .action-buttons.show-buttons {
+      opacity: 1;
+    }
+
+    /* Error / no-results placeholders have no media to hover over — keep the
+       action buttons (e.g. Filter & Playback) always visible so the user always
+       has a way to recover without reloading the dashboard. */
+    .placeholder-actions .action-buttons {
       opacity: 1;
     }
 
@@ -11554,8 +18124,8 @@ class MediaCard extends LitElement {
     }
 
     .action-btn {
-      background: rgba(var(--rgb-card-background-color, 33, 33, 33), 0.8);
-      border: 1px solid rgba(var(--rgb-primary-text-color, 255, 255, 255), 0.2);
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.3);
       border-radius: 50%;
       width: 40px;
       height: 40px;
@@ -11564,59 +18134,86 @@ class MediaCard extends LitElement {
       justify-content: center;
       cursor: pointer;
       transition: all 0.2s ease;
-      color: var(--primary-text-color);
+      color: #ffffff;
       backdrop-filter: blur(10px);
     }
 
     .action-btn:hover {
-      background: rgba(var(--rgb-card-background-color, 33, 33, 33), 0.95);
+      background: rgba(0, 0, 0, 0.75);
       transform: scale(1.15);
-      border-color: rgba(var(--rgb-primary-text-color, 255, 255, 255), 0.4);
+      border-color: rgba(255, 255, 255, 0.5);
     }
 
     .action-btn ha-icon {
       --mdc-icon-size: 24px;
+      color: #ffffff;
     }
 
     /* V4: Highlight pause button when paused */
     .pause-btn.paused {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.15);
+      background: rgba(3, 169, 244, 0.3);
     }
 
     .pause-btn.paused:hover {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.25);
+      background: rgba(3, 169, 244, 0.45);
+    }
+
+    .pause-btn.paused ha-icon {
+      color: #03a9f4;
+    }
+
+    /* V5.6.12: Mute button - highlight when muted */
+    .mute-btn.muted {
+      background: rgba(255, 152, 0, 0.3);
+    }
+
+    .mute-btn.muted:hover {
+      background: rgba(255, 152, 0, 0.45);
+    }
+
+    .mute-btn.muted ha-icon {
+      color: #ff9800;
     }
 
     /* Debug button active state - warning color when enabled */
     .debug-btn.active {
-      color: var(--warning-color, #ff9800);
-      background: rgba(255, 152, 0, 0.15);
+      background: rgba(255, 152, 0, 0.3);
     }
 
     .debug-btn.active:hover {
-      color: var(--warning-color, #ff9800);
-      background: rgba(255, 152, 0, 0.25);
+      background: rgba(255, 152, 0, 0.45);
+    }
+
+    .debug-btn.active ha-icon {
+      color: #ff9800;
     }
 
     .favorite-btn.favorited {
-      color: var(--error-color, #ff5252);
-    }
-
-    .favorite-btn.favorited:hover {
-      color: var(--error-color, #ff5252);
       background: rgba(255, 82, 82, 0.1);
     }
 
+    .favorite-btn.favorited:hover {
+      background: rgba(255, 82, 82, 0.25);
+    }
+
+    .favorite-btn.favorited ha-icon {
+      color: #ff5252;
+    }
+
     .edit-btn:hover {
-      color: var(--warning-color, #ff9800);
       transform: scale(1.15);
     }
 
+    .edit-btn:hover ha-icon {
+      color: #ff9800;
+    }
+
     .delete-btn:hover {
-      color: var(--error-color, #ff5252);
       transform: scale(1.15);
+    }
+
+    .delete-btn:hover ha-icon {
+      color: #ff5252;
     }
 
     /* V4: Delete/Edit Confirmation Dialog */
@@ -11916,7 +18513,357 @@ class MediaCard extends LitElement {
     .confirm-btn:hover {
       background: var(--error-color-dark, #d32f2f);
     }
-    
+
+    /* ── Cast Picker Dialog ─────────────────────────────────────────────────── */
+    .cast-picker-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .cast-picker-content {
+      background: rgba(30, 30, 30, 0.92);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 14px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+      min-width: 280px;
+      max-width: 420px;
+      width: 90%;
+      padding: 20px 16px 16px;
+      animation: dialogSlideIn 0.25s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .cast-picker-title {
+      margin: 0 0 4px;
+      font-size: 15px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.9);
+      text-align: center;
+      letter-spacing: 0.3px;
+    }
+
+    .cast-picker-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .cast-picker-item {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.06);
+      color: white;
+      cursor: pointer;
+      text-align: left;
+      transition: background 0.15s ease;
+    }
+
+    .cast-picker-item:hover {
+      background: rgba(255, 255, 255, 0.14);
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+
+    .cast-picker-item--roku {
+      border-color: rgba(100, 200, 100, 0.35);
+      background: rgba(100, 200, 100, 0.08);
+    }
+
+    .cast-picker-item--roku:hover {
+      background: rgba(100, 200, 100, 0.18);
+    }
+
+    .cast-picker-name {
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .cast-picker-status {
+      font-size: 11px;
+      opacity: 0.55;
+      margin-top: 1px;
+    }
+
+    .cast-picker-cancel {
+      margin-top: 4px;
+      padding: 9px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.06);
+      color: rgba(255, 255, 255, 0.6);
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s ease;
+    }
+
+    .cast-picker-cancel:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: rgba(255, 255, 255, 0.9);
+    }
+
+    /* ── Filter / Playback Picker Dialog ────────────────────────────────────── */
+    .filter-picker-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .filter-picker-content {
+      background: rgba(30, 30, 30, 0.92);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 14px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+      min-width: 300px;
+      max-width: 480px;
+      width: 92%;
+      padding: 20px 16px 16px;
+      animation: dialogSlideIn 0.25s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+
+    .filter-picker-title {
+      margin: 0 0 2px;
+      font-size: 15px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.9);
+      text-align: center;
+      letter-spacing: 0.3px;
+    }
+
+    .filter-picker-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .filter-picker-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: rgba(255, 255, 255, 0.45);
+    }
+
+    .filter-picker-input {
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 13px;
+      padding: 8px 10px;
+      width: 100%;
+      box-sizing: border-box;
+      outline: none;
+    }
+
+    .filter-picker-input:focus {
+      border-color: rgba(255, 255, 255, 0.35);
+    }
+
+    .filter-picker-date-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .filter-picker-date {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 12px;
+      padding: 7px 8px;
+      outline: none;
+      color-scheme: dark;
+    }
+
+    .filter-picker-date:focus {
+      border-color: rgba(255, 255, 255, 0.35);
+    }
+
+    .filter-picker-toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .filter-picker-toggle {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 22px;
+      flex-shrink: 0;
+    }
+
+    .filter-picker-toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .filter-picker-toggle-slider {
+      position: absolute;
+      inset: 0;
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 22px;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+
+    .filter-picker-toggle-slider::before {
+      content: '';
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 3px;
+      top: 3px;
+      background: rgba(255, 255, 255, 0.7);
+      border-radius: 50%;
+      transition: transform 0.2s ease, background 0.2s ease;
+    }
+
+    .filter-picker-toggle input:checked + .filter-picker-toggle-slider {
+      background: var(--primary-color, #03a9f4);
+    }
+
+    .filter-picker-toggle input:checked + .filter-picker-toggle-slider::before {
+      transform: translateX(18px);
+      background: white;
+    }
+
+    .filter-picker-radio-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .filter-picker-radio-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.8);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .filter-picker-radio-label:has(input:checked) {
+      background: rgba(var(--rgb-primary-color, 3, 169, 244), 0.25);
+      border-color: rgba(var(--rgb-primary-color, 3, 169, 244), 0.6);
+    }
+
+    .filter-picker-radio-label input[type="radio"] {
+      display: none;
+    }
+
+    .filter-picker-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .filter-picker-apply {
+      flex: 1;
+      padding: 10px;
+      border-radius: 10px;
+      border: none;
+      background: var(--primary-color, #03a9f4);
+      color: white;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s ease;
+    }
+
+    .filter-picker-apply:hover { opacity: 0.85; }
+
+    .filter-picker-clear {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 100, 100, 0.4);
+      background: rgba(255, 80, 80, 0.12);
+      color: rgba(255, 160, 160, 0.9);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    .filter-picker-clear:hover {
+      background: rgba(255, 80, 80, 0.22);
+    }
+
+    .filter-picker-cancel {
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.06);
+      color: rgba(255, 255, 255, 0.6);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    .filter-picker-cancel:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: rgba(255, 255, 255, 0.9);
+    }
+
+    .filter-picker-browse-btn {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.75);
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s ease, border-color 0.15s ease;
+      flex-shrink: 0;
+    }
+
+    .filter-picker-browse-btn:hover {
+      background: rgba(255, 255, 255, 0.15);
+      border-color: rgba(255, 255, 255, 0.35);
+      color: rgba(255, 255, 255, 0.95);
+    }
+
     /* Info Overlay Styles - Modern dropdown design */
     .info-overlay {
       position: absolute;
@@ -12073,33 +19020,39 @@ class MediaCard extends LitElement {
     }
 
     .info-btn.active {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.15);
+      background: rgba(3, 169, 244, 0.3);
     }
 
     .info-btn.active:hover {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.25);
+      background: rgba(3, 169, 244, 0.45);
+    }
+
+    .info-btn.active ha-icon {
+      color: #03a9f4;
     }
     
     .burst-btn.active {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.15);
+      background: rgba(3, 169, 244, 0.3);
     }
 
     .burst-btn.active:hover {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.25);
+      background: rgba(3, 169, 244, 0.45);
+    }
+
+    .burst-btn.active ha-icon {
+      color: #03a9f4;
     }
     
     .queue-btn.active {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.15);
+      background: rgba(3, 169, 244, 0.3);
     }
 
     .queue-btn.active:hover {
-      color: var(--primary-color, #03a9f4);
-      background: rgba(3, 169, 244, 0.25);
+      background: rgba(3, 169, 244, 0.45);
+    }
+
+    .queue-btn.active ha-icon {
+      color: #03a9f4;
     }
     
     .placeholder {
@@ -12342,11 +19295,36 @@ class MediaCard extends LitElement {
       gap: 8px;
     }
 
+    .panel-header-actions.stacked .top-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: center;
+    }
+
     .panel-header-actions.stacked .bottom-row {
       display: flex;
       align-items: center;
       gap: 8px;
       justify-content: center;
+    }
+
+    .use-photo-date-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 13px;
+      color: var(--primary-text-color);
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    .use-photo-date-checkbox input[type="checkbox"] {
+      cursor: pointer;
+      width: 16px;
+      height: 16px;
+      accent-color: var(--primary-color, #03a9f4);
     }
 
     .panel-action-button {
@@ -12590,6 +19568,45 @@ class MediaCard extends LitElement {
       box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
     }
 
+    /* V5.8: Placeholder shown when video thumbnail fails to load (e.g. Reolink 400) */
+    .thumbnail-failed-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 6px 4px;
+      box-sizing: border-box;
+    }
+
+    .thumbnail-failed-placeholder .tfp-icon {
+      font-size: 1.4em;
+      line-height: 1;
+    }
+
+    .thumbnail-failed-placeholder .tfp-time {
+      color: #fff;
+      font-size: 0.85em;
+      font-weight: 600;
+      font-family: monospace;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+      text-align: center;
+    }
+
+    .thumbnail-failed-placeholder .tfp-duration {
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 0.75em;
+      font-family: monospace;
+      white-space: nowrap;
+    }
+
     .no-items {
       grid-column: 1 / -1;
       text-align: center;
@@ -12597,9 +19614,97 @@ class MediaCard extends LitElement {
       color: var(--secondary-text-color);
       font-size: 14px;
     }
+
+    .thumbnail-menu-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: center;
+      gap: 2px;
+      padding: 34px 4px 4px;
+      z-index: 10;
+      border-radius: inherit;
+    }
+
+    .thumbnail-menu-overlay button {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 6px;
+      border: none;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      white-space: nowrap;
+    }
+
+    .thumbnail-menu-overlay button:hover {
+      background: rgba(255, 255, 255, 0.28);
+    }
+
+    .menu-btn-delete { background: rgba(200, 50, 50, 0.55) !important; }
+    .menu-btn-delete:hover { background: rgba(200, 50, 50, 0.75) !important; }
+
+    .menu-btn-edit { background: rgba(50, 120, 200, 0.55) !important; }
+    .menu-btn-edit:hover { background: rgba(50, 120, 200, 0.75) !important; }
+
+    .menu-btn-cancel {
+      margin-top: 4px;
+      background: rgba(255, 255, 255, 0.08) !important;
+      justify-content: center;
+    }
+
+    /* Prevent accidental long-press + scroll on touch devices */
+    .thumbnail-strip .thumbnail {
+      touch-action: none;
+    }
   `;
 
   render() {
+    // Shared queue config mismatch — this card's blocking config differs from the active queue.
+    // Block the card entirely; it cannot function until the user fixes the config or changes
+    // the shared_queue_id.
+    if (this._configMismatchDetected) {
+      const id = this.config?.shared_queue_id || '';
+      const diffRows = (this._configMismatchDiff || []).map(d => html`
+        <tr>
+          <td style="padding:4px 8px;font-weight:500">${d.label}</td>
+          <td style="padding:4px 8px;color:var(--error-color,#db4437)">${d.mine != null ? String(d.mine) : '(not set)'}</td>
+          <td style="padding:4px 8px;color:var(--warning-color,#ff9800)">${d.theirs != null ? String(d.theirs) : '(not set)'}</td>
+        </tr>
+      `);
+      return html`
+        <ha-card>
+          <div class="card">
+            <div class="placeholder" style="padding:16px;text-align:left">
+              <div style="font-size:1.1em;font-weight:bold;margin-bottom:8px;color:var(--error-color,#db4437)">
+                ⛔ Shared Queue Config Mismatch
+              </div>
+              <div style="margin-bottom:10px;font-size:0.9em">
+                Queue ID <strong>${id}</strong> is already active with different settings.
+                Fix the settings below or change this card's <code>shared_queue_id</code>.
+              </div>
+              <table style="border-collapse:collapse;font-size:0.85em;width:100%">
+                <thead>
+                  <tr style="opacity:0.6">
+                    <th style="padding:4px 8px;text-align:left">Setting</th>
+                    <th style="padding:4px 8px;text-align:left">This card</th>
+                    <th style="padding:4px 8px;text-align:left">Active queue</th>
+                  </tr>
+                </thead>
+                <tbody>${diffRows}</tbody>
+              </table>
+            </div>
+          </div>
+        </ha-card>
+      `;
+    }
+
     if (this.isLoading) {
       return html`
         <ha-card>
@@ -12623,12 +19728,47 @@ class MediaCard extends LitElement {
               <div style="font-weight: bold; margin-bottom: 8px;">⚠️ Media Loading Error</div>
               <div>${errorMessage}</div>
             </div>
+            <div class="placeholder-actions">${this._renderActionButtons()}</div>
           </div>
         </ha-card>
       `;
     }
 
     if (!this.currentMedia) {
+      // Provider is null during a reinit (filter change, reconnect, etc.).
+      // Showing a media_type-specific error banner here would flash "No images/videos
+      // found" on screen for the brief async gap between the old provider being torn
+      // down and the new provider loading its first item.  Show a neutral blank card
+      // instead; the real error messages (No images found / No videos found) are
+      // reserved for when the provider has actually completed a query and truly found
+      // nothing to show.
+      if (!this.provider) {
+        return html`<ha-card><div class="card"></div></ha-card>`;
+      }
+
+      // V5.12: Active filters (or an empty collection) legitimately returned zero items —
+      // not an error. Surface a clear message and keep the Filter & Playback button
+      // reachable so the user can adjust or clear the filter without reloading the dashboard.
+      if (this._noResultsReason === 'filtered' || this._noResultsReason === 'empty_collection') {
+        const message = this._noResultsReason === 'filtered'
+          ? 'No media matches the current filter'
+          : 'No media found in this collection';
+        const hint = this._noResultsReason === 'filtered'
+          ? 'Tap the filter icon above to adjust or clear your filters'
+          : '';
+        return html`
+          <ha-card>
+            <div class="card">
+              <div class="placeholder">
+                <div style="font-weight: 500; margin-bottom: 8px;">${message}</div>
+                ${hint ? html`<div style="font-size: 0.9em; opacity: 0.7;">${hint}</div>` : ''}
+              </div>
+              <div class="placeholder-actions">${this._renderActionButtons()}</div>
+            </div>
+          </ha-card>
+        `;
+      }
+
       // Show helpful message based on media_type filter
       const mediaType = this.config.media_type || 'all';
       let message = 'No media configured';
@@ -12649,10 +19789,12 @@ class MediaCard extends LitElement {
               <div style="font-weight: 500; margin-bottom: 8px;">${message}</div>
               ${hint ? html`<div style="font-size: 0.9em; opacity: 0.7;">${hint}</div>` : ''}
             </div>
+            <div class="placeholder-actions">${this._renderActionButtons()}</div>
           </div>
         </ha-card>
       `;
     }
+
 
     // V5.6: Set transition duration CSS variable (default 300ms)
     const transitionDuration = this.config.transition?.duration ?? 300;
@@ -12720,13 +19862,24 @@ class MediaCard extends LitElement {
       `;
     }
     
-    if (!this.mediaUrl) {
+    const displayUrl = this.mediaUrl;
+    const livePhotoVideoActive = this._livePhotoPhase === 'video' && !!this._livePhotoVideoUrl;
+
+    if (!displayUrl) {
       return html`<div class="placeholder">Resolving media URL...</div>`;
     }
 
-    // V4: Detect media type from media_content_type or filename
-    const isVideo = this.currentMedia?.media_content_type?.startsWith('video') || 
-                    MediaUtils.detectFileType(this.currentMedia?.media_content_id || this.currentMedia?.title || this.mediaUrl) === 'video';
+    // V4: Detect media type from the *resolved* mediaUrl (not currentMedia.media_content_id).
+    // IMPORTANT: currentMedia is set as a reactive Lit property before mediaUrl is resolved.
+    // If we used currentMedia to determine isVideo here, a premature render (triggered by the
+    // reactive property change) would create a <video> element with the OLD mediaUrl (e.g. a jpg
+    // from the previous item), causing the video to "fail" and the correct mp4 to be falsely
+    // removed from the queue as a 404.
+    // By using the resolved mediaUrl, the element type and src are always in sync.
+    // Fallback: use media_content_type for extensionless URLs (e.g. Immich integration).
+    const resolvedUrlType = displayUrl ? MediaUtils.detectFileType(displayUrl) : null;
+    const isVideo = resolvedUrlType === 'video' ||
+                    (resolvedUrlType !== 'image' && this.currentMedia?.media_content_type?.startsWith('video'));
 
     // Compute metadata overlay scale (defaults to 1.0; user configurable via metadata.scale)
     const metadataScale = Math.max(0.3, Math.min(4, Number(this.config?.metadata?.scale) || 1));
@@ -12737,26 +19890,31 @@ class MediaCard extends LitElement {
     
     // Disable backdrop-filter when opacity <= 0.05 to allow true transparency
     const transparentClass = overlayOpacity <= 0.05 ? 'transparent-overlays' : '';
+    
+    // V5.6.7: Hide bottom overlays during video playback (tap center to toggle for video control access)
+    const hideBottomOverlaysClass = this._hideBottomOverlaysForVideo ? 'hide-bottom-overlays' : '';
 
     return html`
       <div 
-        class="media-container ${transparentClass}"
+        class="media-container ${transparentClass} ${hideBottomOverlaysClass}"
         style="--ha-media-metadata-scale: ${metadataScale}; --display-entities-transition: ${displayEntitiesTransition}ms; --ha-overlay-opacity: ${overlayOpacity}"
         @click=${this._handleTap}
         @dblclick=${this._handleDoubleTap}
         @pointerdown=${this._handlePointerDown}
         @pointerup=${this._handlePointerUp}
         @pointercancel=${this._handlePointerCancel}
+        @touchend=${this._handleSwipeTouchEnd}
       >
         ${isVideo ? html`
-          <video 
-            controls
+          <video
+            class="${!this._isSafari && this.config.video_controls_on_tap !== false && !this._videoControlsVisible ? 'hide-controls' : ''}"
+            ?controls=${this._isSafari ? (this.config.video_controls_on_tap === false || this._videoControlsVisible) : true}
             preload="auto"
             playsinline
             crossorigin="anonymous"
             ?loop=${(this.config.video_loop || false) && !(this.config.auto_advance_seconds > 0)}
             ?autoplay=${this.config.video_autoplay !== false}
-            ?muted=${this.config.video_muted !== false}
+            ?muted=${this._getEffectiveMuteState()}
             @loadstart=${this._onVideoLoadStart}
             @error=${this._onMediaError}
             @canplay=${this._onVideoCanPlay}
@@ -12766,21 +19924,26 @@ class MediaCard extends LitElement {
             @ended=${this._onVideoEnded}
             @timeupdate=${this._onVideoTimeUpdate}
             @seeking=${this._onVideoSeeking}
-            @pointerdown=${(e) => { e.stopPropagation(); this._showButtonsExplicitly = true; this._startActionButtonsHideTimer(); this.requestUpdate(); }}
+            @seeked=${this._onVideoSeeked}
+            @volumechange=${this._onVideoVolumeChange}
+            @click=${this._onVideoClickToggle}
+            @dblclick=${this._handleDoubleTap}
+            @pointerdown=${(e) => { this._showButtonsExplicitly = true; this._startActionButtonsHideTimer(); this.requestUpdate(); }}
             @pointermove=${(e) => { e.stopPropagation(); this._showButtonsExplicitly = true; this._startActionButtonsHideTimer(); }}
-            @touchstart=${(e) => { e.stopPropagation(); this._showButtonsExplicitly = true; this._startActionButtonsHideTimer(); this.requestUpdate(); }}
           >
-            <source src="${this.mediaUrl}" type="video/mp4">
-            <source src="${this.mediaUrl}" type="video/webm">
-            <source src="${this.mediaUrl}" type="video/ogg">
-            <p>Your browser does not support the video tag. <a href="${this.mediaUrl}" target="_blank">Download the video</a> instead.</p>
+            <source src="${displayUrl}" type="video/mp4" @error=${this._onSourceError}>
+            <source src="${displayUrl}" type="video/webm" @error=${this._onSourceError}>
+            <source src="${displayUrl}" type="video/ogg" @error=${this._onSourceError}>
+            <p>Your browser does not support the video tag. <a href="${displayUrl}" target="_blank">Download the video</a> instead.</p>
           </video>
           ${this._renderVideoInfo()}
         ` : (this.config?.transition?.duration ?? 300) === 0 ? html`
           <!-- V5.6: Instant mode - single image, no layers -->
           <img 
-            src="${this.mediaUrl}" 
+            src="${displayUrl}" 
             alt="${this.currentMedia.title || 'Media'}"
+            draggable="false"
+            @pointerdown=${(e) => e.preventDefault()}
             @error=${this._onMediaError}
             @load=${this._onMediaLoaded}
           />
@@ -12791,6 +19954,8 @@ class MediaCard extends LitElement {
               class="image-layer ${this._frontLayerActive ? 'active' : 'inactive'}"
               src="${this._frontLayerUrl}" 
               alt="${this.currentMedia.title || 'Media'}"
+              draggable="false"
+              @pointerdown=${(e) => e.preventDefault()}
               @error=${this._onMediaError}
               @load=${this._onMediaLoaded}
             />
@@ -12800,10 +19965,27 @@ class MediaCard extends LitElement {
               class="image-layer ${!this._frontLayerActive ? 'active' : 'inactive'}"
               src="${this._backLayerUrl}" 
               alt="${this.currentMedia.title || 'Media'}"
+              draggable="false"
+              @pointerdown=${(e) => e.preventDefault()}
               @error=${this._onMediaError}
               @load=${this._onMediaLoaded}
             />
           ` : ''}
+        ` : ''}
+        ${livePhotoVideoActive ? html`
+          <video
+            class="live-photo-video ${this._livePhotoVideoReady ? 'ready' : ''}"
+            preload="auto"
+            playsinline
+            autoplay
+            muted
+            crossorigin="anonymous"
+            src="${this._livePhotoVideoUrl}"
+            @canplay=${this._onLivePhotoVideoCanPlay}
+            @playing=${this._onLivePhotoVideoCanPlay}
+            @ended=${this._onLivePhotoVideoEnded}
+            @error=${this._onLivePhotoVideoError}
+          ></video>
         ` : ''}
         ${this._renderNavigationZones()}
         ${this._renderMetadataOverlay()}
@@ -12832,24 +20014,54 @@ class MediaCard extends LitElement {
     return html`
       <div class="navigation-zones">
            <div class="nav-zone nav-zone-left ${this._showButtonsExplicitly ? 'show-buttons' : ''}"
-             @click=${async (e) => { 
-            e.stopPropagation(); 
-            // Navigate first
-            await this._loadPrevious(); 
-            // If buttons are showing, restart the 3s timer to auto-hide
-            if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+             @click=${async (e) => {
+            e.stopPropagation();
+            if (this._isVideoFile(this.mediaUrl || '')) {
+              // On video: debounce to let dblclick handler cancel nav and seek instead
+              if (this._navClickTimerLeft) { clearTimeout(this._navClickTimerLeft); this._navClickTimerLeft = null; return; }
+              this._navClickTimerLeft = setTimeout(async () => {
+                this._navClickTimerLeft = null;
+                this._isManualNavigation = true;
+                await this._loadPrevious();
+                if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+              }, 280);
+            } else {
+              this._isManualNavigation = true;
+              await this._loadPrevious();
+              if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+            }
+             }}
+             @dblclick=${(e) => {
+            e.stopPropagation();
+            if (this._navClickTimerLeft) { clearTimeout(this._navClickTimerLeft); this._navClickTimerLeft = null; }
+            if (this._isVideoFile(this.mediaUrl || '')) this._seekVideo(-10);
              }}
              @keydown=${this.config.enable_keyboard_navigation !== false ? this._handleKeyDown : null}
              tabindex="0"
              title="Previous">
         </div>
            <div class="nav-zone nav-zone-right ${this._showButtonsExplicitly ? 'show-buttons' : ''}"  
-             @click=${async (e) => { 
-            e.stopPropagation(); 
-            // Navigate first
-            await this._loadNext(); 
-            // If buttons are showing, restart the 3s timer to auto-hide
-            if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+             @click=${async (e) => {
+            e.stopPropagation();
+            if (this._isVideoFile(this.mediaUrl || '')) {
+              // On video: debounce to let dblclick handler cancel nav and seek instead
+              if (this._navClickTimerRight) { clearTimeout(this._navClickTimerRight); this._navClickTimerRight = null; return; }
+              this._navClickTimerRight = setTimeout(async () => {
+                this._navClickTimerRight = null;
+                this._isManualNavigation = true;
+                await this._loadNext();
+                if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+              }, 280);
+            } else {
+              this._isManualNavigation = true;
+              await this._loadNext();
+              if (this._showButtonsExplicitly) { this._startActionButtonsHideTimer(); }
+            }
+             }}
+             @dblclick=${(e) => {
+            e.stopPropagation();
+            if (this._navClickTimerRight) { clearTimeout(this._navClickTimerRight); this._navClickTimerRight = null; }
+            if (this._isVideoFile(this.mediaUrl || '')) this._seekVideo(10);
              }}
              @keydown=${this.config.enable_keyboard_navigation !== false ? this._handleKeyDown : null}
              tabindex="0"
@@ -12939,9 +20151,23 @@ class MediaCard extends LitElement {
       title = '📅 Same Date';
       subtitle = `${this._panelQueue.length} media items from this date/time`;
     } else if (this._panelMode === 'on_this_day') {
-      const today = new Date();
-      const monthDay = today.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      const currentYear = today.getFullYear();
+      // V5.6.7: Use either today's date or current photo's date based on toggle
+      let displayDate;
+      if (this._onThisDayUsePhotoDate) {
+        // Use current photo's date
+        const currentTimestamp = this._currentMetadata?.date_taken || this._currentMetadata?.created_time;
+        if (currentTimestamp) {
+          displayDate = new Date(currentTimestamp * 1000);
+        } else {
+          displayDate = new Date(); // Fallback to today if no photo timestamp
+        }
+      } else {
+        // Use today's date (default)
+        displayDate = new Date();
+      }
+      
+      const monthDay = displayDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      
       // Calculate year range from photos if available, otherwise show reasonable range
       let yearRange = '';
       if (this._panelQueue.length > 0) {
@@ -12975,17 +20201,27 @@ class MediaCard extends LitElement {
             <div class="title-text">${title}</div>
           </div>
           <div class="panel-header-actions stacked">
-            <select 
-              class="window-selector" 
-              .value=${String(this._onThisDayWindowDays)}
-              @change=${this._handleWindowSizeChange}
-              title="Adjust date range">
-              <option value="0">Exact</option>
-              <option value="1">±1 day</option>
-              <option value="3">±3 days</option>
-              <option value="7">±1 week</option>
-              <option value="14">±2 weeks</option>
-            </select>
+            <div class="top-row">
+              <select 
+                class="window-selector" 
+                .value=${String(this._onThisDayWindowDays)}
+                @change=${this._handleWindowSizeChange}
+                title="Adjust date range">
+                <option value="0">Exact</option>
+                <option value="1">±1 day</option>
+                <option value="3">±3 days</option>
+                <option value="7">±1 week</option>
+                <option value="14">±2 weeks</option>
+              </select>
+              <label class="use-photo-date-checkbox" title="Use photo's date instead of today's date">
+                <input 
+                  type="checkbox" 
+                  .checked=${this._onThisDayUsePhotoDate}
+                  @change=${this._handleUsePhotoDateChange}
+                />
+                <span>📸 Photo Date</span>
+              </label>
+            </div>
             <div class="bottom-row">
               <label class="randomize-checkbox" title="Randomize playback order">
                 <input 
@@ -13096,7 +20332,11 @@ class MediaCard extends LitElement {
   _renderThumbnailStrip() {
     // For queue mode, read directly from navigationQueue
     const allItems = this._panelMode === 'queue' ? this.navigationQueue : this._panelQueue;
-    
+    const activeIndex = this._panelMode === 'queue'
+      ? this.navigationIndex
+      : this._panelQueueIndex;
+    const isQueuePanel = this._panelMode === 'queue';
+
     if (!allItems || allItems.length === 0) {
       return html`
         <div class="thumbnail-strip">
@@ -13112,22 +20352,36 @@ class MediaCard extends LitElement {
     // Initialize unified page start index
     if (this._panelPageStartIndex === undefined || this._panelPageStartIndex === null) {
       if (this._panelMode === 'queue') {
-        this._panelPageStartIndex = this.navigationIndex;
+        // Center the current item so items before it are also visible
+        this._panelPageStartIndex = Math.max(0, this.navigationIndex - Math.floor(maxDisplay / 2));
       } else {
         this._panelPageStartIndex = 0; // Start at beginning for burst/related
       }
     }
     
-    // Auto-adjust page for queue mode only (burst/related stay on current page)
-    if (this._panelMode === 'queue' && !this._manualPageChange) {
+    // Auto-adjust page for queue mode only (burst/related/same_date/on_this_day stay on current page)
+    // V5.6.8: Simplified logic for queue preview auto-paging:
+    // - If current navigationIndex is ON the visible page, keep it visible (auto-page if moving off)
+    // - If current navigationIndex is NOT on visible page AND user manually paged, don't auto-page
+    // - If user navigates and the new position would be highlighted, allow auto-paging again
+    if (this._panelMode === 'queue') {
       const currentPageEnd = this._panelPageStartIndex + maxDisplay;
+      const isCurrentIndexOnPage = this.navigationIndex >= this._panelPageStartIndex && this.navigationIndex < currentPageEnd;
       
-      if (this.navigationIndex < this._panelPageStartIndex) {
-        // Navigated backward beyond current page
-        this._panelPageStartIndex = Math.max(0, this.navigationIndex - maxDisplay + 1);
-      } else if (this.navigationIndex >= currentPageEnd) {
-        // Navigated forward beyond current page
-        this._panelPageStartIndex = this.navigationIndex;
+      // If current index IS on the page, clear manual flag - user is viewing active item
+      if (isCurrentIndexOnPage) {
+        this._manualPageChange = false;
+      }
+      
+      // Auto-adjust if not manually paged away
+      if (!this._manualPageChange) {
+        if (this.navigationIndex < this._panelPageStartIndex) {
+          // Navigated backward beyond current page
+          this._panelPageStartIndex = Math.max(0, this.navigationIndex - maxDisplay + 1);
+        } else if (this.navigationIndex >= currentPageEnd) {
+          // Navigated forward beyond current page  
+          this._panelPageStartIndex = this.navigationIndex;
+        }
       }
     }
     
@@ -13158,6 +20412,19 @@ class MediaCard extends LitElement {
     
     displayItems.forEach(async (item) => {
       if (!item._resolvedUrl && !item._resolving) {
+        // Check the card-level persistent cache first — this survives queue refills,
+        // so we never re-fire a WebSocket call for a URL we have already resolved.
+        const cacheKey = item.media_source_uri || item.media_content_id || item.path;
+        const _cachedEntry = cacheKey && this._thumbnailUrlCache?.get(cacheKey);
+        if (_cachedEntry) {
+          if (Date.now() < _cachedEntry.expiresAt) {
+            item._resolvedUrl = _cachedEntry.url;
+            return;
+          }
+          // Stale — evict so we re-resolve with a fresh signed URL.
+          this._thumbnailUrlCache.delete(cacheKey);
+        }
+
         item._resolving = true;
         pendingResolutions++;
         
@@ -13172,6 +20439,19 @@ class MediaCard extends LitElement {
             expires: 3600
           });
           item._resolvedUrl = resolved.url;
+
+          // Persist in card-level cache with TTL (capped at 2000 entries, evict oldest).
+          // The resolve_media response includes an `expires` field (Unix timestamp in
+          // seconds); use it when present, otherwise fall back to a 1-hour TTL.
+          if (this._thumbnailUrlCache && cacheKey) {
+            const expiresAt = resolved.expires
+              ? resolved.expires * 1000
+              : Date.now() + 3600 * 1000;
+            this._thumbnailUrlCache.set(cacheKey, { url: resolved.url, expiresAt });
+            if (this._thumbnailUrlCache.size > 2000) {
+              this._thumbnailUrlCache.delete(this._thumbnailUrlCache.keys().next().value);
+            }
+          }
           
           // Only request update once after all thumbnails resolve
           pendingResolutions--;
@@ -13193,7 +20473,13 @@ class MediaCard extends LitElement {
     });
 
     return html`
-      <div class="thumbnail-strip" style="--thumbnail-height: ${thumbnailHeight}px">
+      <div class="thumbnail-strip" style="--thumbnail-height: ${thumbnailHeight}px"
+           @click=${() => {
+             if (this._thumbnailMenuIndex !== null) {
+               this._thumbnailMenuIndex = null;
+               this.requestUpdate();
+             }
+           }}>
         ${hasPreviousPage ? html`
           <button class="page-nav-button prev-page" @click=${() => this._pageQueueThumbnails('prev')}>
             <ha-icon icon="mdi:chevron-up"></ha-icon>
@@ -13203,21 +20489,21 @@ class MediaCard extends LitElement {
         
         ${displayItems.map((item, displayIndex) => {
           const actualIndex = displayStartIndex + displayIndex;
-          const isActive = this._panelMode === 'queue' 
-            ? actualIndex === this.navigationIndex 
-            : actualIndex === this._panelQueueIndex;
+          const isActive = actualIndex === activeIndex;
           const itemUri = item.media_source_uri || item.media_content_id || item.path;
-          // Check multiple sources for favorite status (check rating too - 5 stars = favorite)
+          // Check multiple sources for favorite status.
           // Queue items store metadata inside item.metadata object
           const isFavoriteFlag = (value) =>
             value === true ||
             value === 1 ||
             value === 'true' ||
             value === '1';
+          // Note: rating===5 is intentionally excluded here. _burstFavoritedFiles is
+          // initialised from rating>=4 at panel open, so it is already the canonical
+          // session truth. Keeping rating as a separate path prevented the ♥ badge from
+          // clearing when a user unfavourited an item mid-session (rating never changed).
           const isFavorited = isFavoriteFlag(item.is_favorited) ||
-                              item.rating === 5 ||
                               isFavoriteFlag(item.metadata?.is_favorited) ||
-                              item.metadata?.rating === 5 ||
                               this._burstFavoritedFiles.includes(itemUri) ||
                               (this.currentMedia?.media_content_id === itemUri &&
                                 isFavoriteFlag(this.currentMedia?.metadata?.is_favorited));
@@ -13249,15 +20535,72 @@ class MediaCard extends LitElement {
           const isVideo = this._isVideoItem(item);
           const videoThumbnailTime = this.config.video_thumbnail_time || 1;
           const isVideoLoaded = isVideo && this._isVideoThumbnailLoaded(item);
+          const cacheKey = item.media_content_id || item.path;
           
           return html`
             <div 
-              class="thumbnail ${isActive ? 'active' : ''} ${isFavorited ? 'favorited' : ''}"
-              @click=${() => this._panelMode === 'queue' ? this._jumpToQueuePosition(actualIndex) : this._loadPanelItem(actualIndex)}
-              title="${item.filename || item.path}"
+              class="thumbnail ${isFavorited ? 'favorited' : ''}"
+              data-item-index="${actualIndex}"
+              @pointerdown=${() => {
+                this._thumbnailHoldTimer = setTimeout(() => {
+                  this._thumbnailMenuIndex = actualIndex;
+                  this._thumbnailHoldFired = true;
+                  this._thumbnailHoldTimer = null;
+                  this.requestUpdate();
+                }, 600);
+              }}
+              @pointerup=${() => {
+                if (this._thumbnailHoldTimer) {
+                  clearTimeout(this._thumbnailHoldTimer);
+                  this._thumbnailHoldTimer = null;
+                }
+              }}
+              @pointercancel=${() => {
+                if (this._thumbnailHoldTimer) {
+                  clearTimeout(this._thumbnailHoldTimer);
+                  this._thumbnailHoldTimer = null;
+                }
+              }}
+              @click=${(e) => {
+                if (this._thumbnailHoldFired) {
+                  this._thumbnailHoldFired = false;
+                  e.stopPropagation(); // prevent strip dismiss-click from closing the menu
+                  return;
+                }
+                if (actualIndex === activeIndex) {
+                  // Active item → toggle favourite (all panels)
+                  this._handleFavoriteClick(e, isFavorited);
+                } else if (isQueuePanel) {
+                  this._jumpToQueuePosition(actualIndex);
+                } else {
+                  this._loadPanelItem(actualIndex);
+                }
+              }}
+              title="${item.title || item.filename || item.path}"
+              data-cache-key="${cacheKey}"
             >
               ${item._resolvedUrl ? (
-                isVideo ? html`
+                isVideo ? (() => {
+                  if (item._thumbnailFailed) {
+                    // V5.8: Video thumbnail failed (e.g. Reolink NVR returned 400).
+                    // Show a text placeholder with time + duration derived from item.title or
+                    // item.filename (format: "HH:MM:SS D:MM:SS" e.g. "12:22:48 0:02:50").
+                    // Reolink queue items use item.title (set by timestamp extraction in
+                    // SubfolderQueue); file-based items use item.filename.
+                    // Parse by splitting on the first space; both halves already formatted.
+                    const fname = item.title || item.filename || '';
+                    const spaceIdx = fname.indexOf(' ');
+                    const tfpTime = spaceIdx > 0 ? fname.substring(0, spaceIdx) : fname;
+                    const tfpDuration = spaceIdx > 0 ? fname.substring(spaceIdx + 1) : '';
+                    return html`
+                      <div class="thumbnail-failed-placeholder">
+                        <span class="tfp-icon">🎞️</span>
+                        ${tfpTime ? html`<span class="tfp-time">${tfpTime}</span>` : ''}
+                        ${tfpDuration ? html`<span class="tfp-duration">${tfpDuration}</span>` : ''}
+                      </div>
+                    `;
+                  }
+                  return html`
                   <video 
                     class="thumbnail-video ${isVideoLoaded ? 'loaded' : ''}"
                     preload="metadata"
@@ -13271,6 +20614,12 @@ class MediaCard extends LitElement {
                     @error=${(e) => this._handleThumbnailError(e, item)}
                   ></video>
                   <div class="video-icon-overlay">🎞️</div>
+                `;
+                })() : item._thumbnailFailed ? html`
+                  <div class="thumbnail-failed-placeholder">
+                    <span class="tfp-icon">🖼️</span>
+                    <span class="tfp-time">${item.filename || ''}</span>
+                  </div>
                 ` : html`
                   <img 
                     src="${item._resolvedUrl}" 
@@ -13283,6 +20632,39 @@ class MediaCard extends LitElement {
               `}
               ${badge ? html`<div class="time-badge">${badge}</div>` : ''}
               ${isFavorited ? html`<div class="favorite-badge">♥</div>` : ''}
+              ${this._thumbnailMenuIndex === actualIndex ? html`
+                <div class="thumbnail-menu-overlay" @click=${(e) => e.stopPropagation()}>
+                  <button @click=${() => {
+                    this._thumbnailMenuIndex = null;
+                    isQueuePanel
+                      ? this._removeFromQueue(actualIndex)
+                      : this._removeFromPanelQueue(actualIndex);
+                  }}>
+                    <ha-icon icon="mdi:eye-off-outline"></ha-icon>
+                    Clear
+                  </button>
+                  <button class="menu-btn-delete" @click=${async () => {
+                    this._thumbnailMenuIndex = null;
+                    this.requestUpdate();
+                    await this._handleThumbnailMenuDelete(item);
+                  }}>
+                    <ha-icon icon="mdi:trash-can-outline"></ha-icon> Move to _Junk
+                  </button>
+                  <button class="menu-btn-edit" @click=${async () => {
+                    this._thumbnailMenuIndex = null;
+                    this.requestUpdate();
+                    await this._handleThumbnailMenuEdit(item);
+                  }}>
+                    <ha-icon icon="mdi:folder-move-outline"></ha-icon> Move to _Edit
+                  </button>
+                  <button class="menu-btn-cancel" @click=${() => {
+                    this._thumbnailMenuIndex = null;
+                    this.requestUpdate();
+                  }}>
+                    ✕ Cancel
+                  </button>
+                </div>
+              ` : ''}
             </div>
           `;
         })}
@@ -13302,7 +20684,6 @@ class MediaCard extends LitElement {
  * MediaCardEditor - Card editor with full functionality
  * Will be adapted for v5 architecture in next phase
  */
-
 
 /**
  * MediaCardEditor - Card editor with full functionality
@@ -13333,7 +20714,22 @@ class MediaCardEditor extends LitElement {
       sanitizedConfig.auto_refresh_seconds = undefined;
     }
     
+    // Check if legacy fields exist before cleanup
+    const hasLegacyFields = sanitizedConfig.auto_advance_duration !== undefined || 
+                           sanitizedConfig.auto_advance_interval !== undefined;
+    
+    // Clean up legacy auto-advance fields to prevent conflicts
+    delete sanitizedConfig.auto_advance_duration;
+    delete sanitizedConfig.auto_advance_interval;
+    
     this._config = sanitizedConfig;
+    
+    // If legacy fields were removed, automatically save the cleaned config
+    if (hasLegacyFields) {
+      this._log('🧹 Detected legacy auto-advance fields, automatically saving cleaned config');
+      // Use setTimeout to ensure the config is set before firing the change event
+      setTimeout(() => this._fireConfigChanged(), 0);
+    }
   }
 
   // V4 to V5 Migration
@@ -13820,6 +21216,65 @@ class MediaCardEditor extends LitElement {
     return '';
   }
 
+  _updateTimeRangeConfig(key, value) {
+    const filters = { ...this._config.filters };
+    const timeRange = { ...filters.time_range };
+
+    if (value) {
+      timeRange[key] = value;
+    } else {
+      delete timeRange[key];
+    }
+
+    if (timeRange.start || timeRange.end) {
+      filters.time_range = timeRange;
+    } else {
+      delete filters.time_range;
+    }
+
+    delete filters.time_start;
+    delete filters.time_end;
+
+    if (Object.keys(filters).length === 0) {
+      const newConfig = { ...this._config };
+      delete newConfig.filters;
+      this._config = newConfig;
+    } else {
+      this._config = {
+        ...this._config,
+        filters: filters
+      };
+    }
+
+    this._fireConfigChanged();
+  }
+
+  _handleTimeRangeStartChanged(ev) {
+    this._updateTimeRangeConfig('start', ev.target.value || null);
+  }
+
+  _handleTimeRangeEndChanged(ev) {
+    this._updateTimeRangeConfig('end', ev.target.value || null);
+  }
+
+  _getTimeRangeDescription() {
+    const filters = this._config.filters || {};
+    const start = filters.time_range?.start || filters.time_start;
+    const end = filters.time_range?.end || filters.time_end;
+
+    if (start && end) {
+      if (start > end) {
+        return `🕒 Showing media from ${start} to ${end} (crosses midnight)`;
+      }
+      return `🕒 Showing media from ${start} to ${end}`;
+    } else if (start) {
+      return `🕒 Showing media from ${start} onwards each day`;
+    } else if (end) {
+      return `🕒 Showing media up to ${end} each day`;
+    }
+    return '';
+  }
+
   _parsePriorityFolders(text) {
     // NOT USED - keeping for backward compatibility
     if (!text || text.trim() === '') return [];
@@ -14134,6 +21589,16 @@ class MediaCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
+  _cardHeightFillChanged(ev) {
+    if (ev.target.checked) {
+      this._config = { ...this._config, card_height_fill: true };
+    } else {
+      const { card_height_fill, ...rest } = this._config;
+      this._config = rest;
+    }
+    this._fireConfigChanged();
+  }
+
   _autoRefreshChanged(ev) {
     const seconds = parseInt(ev.target.value) || 0;
     this._config = { ...this._config, auto_refresh_seconds: seconds };
@@ -14153,6 +21618,11 @@ class MediaCardEditor extends LitElement {
 
   _refreshButtonChanged(ev) {
     this._config = { ...this._config, show_refresh_button: ev.target.checked };
+    this._fireConfigChanged();
+  }
+
+  _disableCacheBustingChanged(ev) {
+    this._config = { ...this._config, disable_cache_busting: ev.target.checked };
     this._fireConfigChanged();
   }
   
@@ -14471,6 +21941,25 @@ class MediaCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
+  _metadataShowBurstInfoChanged(ev) {
+    this._config = {
+      ...this._config,
+      metadata: {
+        ...this._config.metadata,
+        show_burst_info: ev.target.checked
+      }
+    };
+    this._fireConfigChanged();
+  }
+
+  _autoSelectBurstFavoriteChanged(ev) {
+    this._config = {
+      ...this._config,
+      auto_select_burst_favorite: ev.target.checked
+    };
+    this._fireConfigChanged();
+  }
+
   _metadataScaleChanged(ev) {
     // Accept empty to clear (use default = 1)
     const raw = ev.target.value;
@@ -14606,6 +22095,20 @@ class MediaCardEditor extends LitElement {
         hide_on_this_day_button: ev.target.checked
       }
     };
+    this._fireConfigChanged();
+  }
+
+  _showCastButtonChanged(ev) {
+    this._config = ev.target.checked
+      ? { ...this._config, show_cast_button: true }
+      : (() => { const c = { ...this._config }; delete c.show_cast_button; return c; })();
+    this._fireConfigChanged();
+  }
+
+  _showFilterButtonChanged(ev) {
+    this._config = ev.target.checked
+      ? { ...this._config, show_filter_button: true }
+      : (() => { const c = { ...this._config }; delete c.show_filter_button; return c; })();
     this._fireConfigChanged();
   }
 
@@ -15123,49 +22626,41 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     
     // Force remove any existing dialogs first
     const existingDialogs = document.querySelectorAll('[data-media-browser-dialog="true"]');
-    existingDialogs.forEach(d => d.remove());
+    existingDialogs.forEach(d => {
+      if (d instanceof HTMLDialogElement && d.open) {
+        d.close();
+      }
+      d.remove();
+    });
     
-    // Create a custom dialog element with proper event isolation
-    const dialog = document.createElement('div');
+    // Use native <dialog> element with showModal() for top-layer rendering
+    // This guarantees the dialog appears above everything, including HA's card editor
+    const dialog = document.createElement('dialog');
     dialog.setAttribute('data-media-browser-dialog', 'true');
     
-    // Remove any inert attributes and force interactive state
-    dialog.removeAttribute('inert');
-    dialog.setAttribute('aria-modal', 'true');
-    dialog.setAttribute('role', 'dialog');
-    
     dialog.style.cssText = `
-      position: fixed !important;
-      top: 0 !important;
-      left: 0 !important;
-      width: 100vw !important;
-      height: 100vh !important;
-      background: rgba(0, 0, 0, 0.9) !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      z-index: 2147483647 !important;
-      backdrop-filter: blur(3px) !important;
-      font-family: system-ui, -apple-system, sans-serif !important;
-      pointer-events: auto !important;
-    `;
-
-    const dialogContent = document.createElement('div');
-    dialogContent.setAttribute('aria-labelledby', 'media-browser-title');
-    dialogContent.style.cssText = `
-      background: var(--card-background-color, #fff) !important;
+      border: none !important;
       border-radius: 8px !important;
       padding: 20px !important;
       max-width: 600px !important;
+      width: 90vw !important;
       max-height: 80vh !important;
       overflow-y: auto !important;
-      color: var(--primary-text-color, #333) !important;
+      background: var(--card-background-color, #1c1c1c) !important;
+      color: var(--primary-text-color, #fff) !important;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
-      position: relative !important;
-      margin: 20px !important;
-      pointer-events: auto !important;
-      transform: scale(1) !important;
+      font-family: system-ui, -apple-system, sans-serif !important;
     `;
+    
+    // Style the backdrop
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `
+      dialog[data-media-browser-dialog]::backdrop {
+        background: rgba(0, 0, 0, 0.85);
+        backdrop-filter: blur(3px);
+      }
+    `;
+    dialog.appendChild(styleEl);
 
     const title = document.createElement('h3');
     title.id = 'media-browser-title';
@@ -15173,11 +22668,10 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     title.style.cssText = `
       margin-top: 0 !important;
       margin-bottom: 16px !important;
-      color: var(--primary-text-color, #333) !important;
-      border-bottom: 1px solid var(--divider-color, #ddd) !important;
+      color: var(--primary-text-color, #fff) !important;
+      border-bottom: 1px solid var(--divider-color, #444) !important;
       padding-bottom: 8px !important;
       font-size: 18px !important;
-      pointer-events: none !important;
     `;
 
     const fileList = document.createElement('div');
@@ -15187,7 +22681,6 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
       margin: 16px 0 !important;
       max-height: 400px !important;
       overflow-y: auto !important;
-      pointer-events: auto !important;
     `;
 
     // Add media files to the list
@@ -15196,12 +22689,11 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     const buttonContainer = document.createElement('div');
     buttonContainer.style.cssText = `
       display: flex !important;
-      justify-content: space-between !important;
+      justify-content: flex-end !important;
       gap: 8px !important;
       margin-top: 16px !important;
-      border-top: 1px solid var(--divider-color, #ddd) !important;
+      border-top: 1px solid var(--divider-color, #444) !important;
       padding-top: 16px !important;
-      pointer-events: auto !important;
     `;
 
     const closeButton = document.createElement('button');
@@ -15214,68 +22706,67 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
       cursor: pointer !important;
       color: white !important;
       font-size: 14px !important;
-      pointer-events: auto !important;
-      z-index: 999999999 !important;
     `;
 
     // Dialog close function with proper cleanup
     const closeDialog = () => {
       this._log('Closing media browser dialog');
-      document.removeEventListener('keydown', handleKeydown);
-      if (dialog && dialog.parentNode) {
-        document.body.removeChild(dialog);
-        this._log('Dialog closed successfully');
+      if (dialog.open) {
+        dialog.close();
       }
+      if (dialog.parentNode) {
+        dialog.parentNode.removeChild(dialog);
+      }
+      this._log('Dialog closed successfully');
     };
 
     closeButton.onclick = (e) => {
       this._log('Cancel button clicked');
       closeDialog();
-      return false;
     };
 
-    dialog.onclick = (e) => {
+    // Handle clicking outside the dialog (on backdrop)
+    dialog.addEventListener('click', (e) => {
       if (e.target === dialog) {
         closeDialog();
       }
-    };
+    });
 
-    const handleKeydown = (e) => {
+    // Handle Escape key - prevent bubbling to HA's card editor
+    dialog.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        this._log('Escape key pressed');
+        e.preventDefault();
+        e.stopPropagation();
         closeDialog();
       }
-    };
-    document.addEventListener('keydown', handleKeydown);
+    });
+
+    // Handle native dialog close event (cleanup)
+    dialog.addEventListener('close', () => {
+      if (dialog.parentNode) {
+        dialog.parentNode.removeChild(dialog);
+      }
+    });
 
     buttonContainer.appendChild(closeButton);
-    dialogContent.appendChild(title);
-    dialogContent.appendChild(fileList);
-    dialogContent.appendChild(buttonContainer);
-    dialog.appendChild(dialogContent);
+    dialog.appendChild(title);
+    dialog.appendChild(fileList);
+    dialog.appendChild(buttonContainer);
     
-    this._log('Appending dialog to document.body');
+    // Append to document.body and show as modal (uses browser's top-layer)
     document.body.appendChild(dialog);
-    
-    // Force focus and remove inert state
-    requestAnimationFrame(() => {
-      dialog.removeAttribute('inert');
-      dialogContent.removeAttribute('inert');
-      document.querySelectorAll('[inert]').forEach(el => el.removeAttribute('inert'));
-      dialog.focus();
-      dialog.setAttribute('tabindex', '0');
-      this._log('Media browser dialog opened and focused');
-    });
+    dialog.showModal();
+    this._log('Media browser dialog opened with showModal()');
   }
 
   async _addMediaFilesToBrowser(container, mediaContent, dialog, currentPath = '') {
     // ALWAYS log - bypassing debug check for diagnosis
 
-    console.log('[MediaCard] Adding media files to browser:', mediaContent.children.length, 'items');
+    console.log('[MediaViewerCard] Adding media files to browser:', mediaContent.children.length, 'items');
     
     // Log first few items for debugging (especially for Reolink integration)
     if (mediaContent.children && mediaContent.children.length > 0) {
-      console.log('[MediaCard] 📋 First 3 items in browser:', JSON.stringify(mediaContent.children.slice(0, 3), null, 2));
+      console.log('[MediaViewerCard] 📋 First 3 items in browser:', JSON.stringify(mediaContent.children.slice(0, 3), null, 2));
     }
     
     const itemsToCheck = (mediaContent.children || []).slice(0, 50);
@@ -15288,7 +22779,7 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
       // Fallback to extension check for filesystem sources
       const fileName = this._getItemDisplayName(item);
       const isMedia = !isFolder && this._isMediaFile(fileName);
-      console.log(`[MediaCard]   Item check: ${fileName} | can_expand=${item.can_expand} | media_class=${item.media_class} | isMedia=${isMedia}`);
+      console.log(`[MediaViewerCard]   Item check: ${fileName} | can_expand=${item.can_expand} | media_class=${item.media_class} | isMedia=${isMedia}`);
       return isMedia;
     });
     
@@ -15388,13 +22879,13 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     // Filter items to display based on media type configuration
     const itemsToShow = (mediaContent.children || []).filter(item => {
       if (item.can_expand) {
-        console.log(`[MediaCard] ✅ Including folder: ${this._getItemDisplayName(item)}`);
+        console.log(`[MediaViewerCard] ✅ Including folder: ${this._getItemDisplayName(item)}`);
         return true;
       }
       
       // Check media_class first (works for Reolink, Immich, and other API-based sources)
       if (item.media_class === 'image' || item.media_class === 'video') {
-        console.log(`[MediaCard] ✅ media_class check: ${this._getItemDisplayName(item)} | media_class=${item.media_class}`);
+        console.log(`[MediaViewerCard] ✅ media_class check: ${this._getItemDisplayName(item)} | media_class=${item.media_class}`);
         return true;
       }
       
@@ -15403,18 +22894,18 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
         const fileName = this._getItemDisplayName(item);
         const fileType = this._detectFileType(fileName);
         const included = fileType === this._config.media_type;
-        console.log(`[MediaCard] ${included ? '✅' : '❌'} Media type filter (${this._config.media_type}): ${fileName} → ${fileType}`);
+        console.log(`[MediaViewerCard] ${included ? '✅' : '❌'} Media type filter (${this._config.media_type}): ${fileName} → ${fileType}`);
         return included;
       }
       
       // Fallback to extension check for filesystem sources
       const fileName = this._getItemDisplayName(item);
       const isMedia = this._isMediaFile(fileName);
-      console.log(`[MediaCard] ${isMedia ? '✅' : '❌'} Extension check: ${fileName} | media_class=${item.media_class} | media_content_id=${item.media_content_id}`);
+      console.log(`[MediaViewerCard] ${isMedia ? '✅' : '❌'} Extension check: ${fileName} | media_class=${item.media_class} | media_content_id=${item.media_content_id}`);
       return isMedia;
     });
     
-    console.log(`[MediaCard] 📊 Filter results: ${itemsToShow.length} items to show (from ${mediaContent.children.length} total)`);
+    console.log(`[MediaViewerCard] 📊 Filter results: ${itemsToShow.length} items to show (from ${mediaContent.children.length} total)`);
     
     for (const item of itemsToShow) {
       const fileItem = document.createElement('div');
@@ -15551,8 +23042,9 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
         fileItem.onclick = () => {
           this._log('File clicked:', item.media_content_id);
           this._handleMediaPicked(item.media_content_id);
-          if (dialog && dialog.parentNode) {
-            document.body.removeChild(dialog);
+          if (dialog) {
+            if (dialog.open) dialog.close();
+            if (dialog.parentNode) dialog.parentNode.removeChild(dialog);
           }
           return false;
         };
@@ -15641,8 +23133,9 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
       
       this._fireConfigChanged();
       
-      if (dialog && dialog.parentNode) {
-        document.body.removeChild(dialog);
+      if (dialog) {
+        if (dialog.open) dialog.close();
+        if (dialog.parentNode) dialog.parentNode.removeChild(dialog);
       }
     };
 
@@ -15859,7 +23352,7 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
   }
 
   _handleMediaPicked(mediaContentId) {
-    console.log('[MediaCard] Media picked:', mediaContentId);
+    console.log('[MediaViewerCard] Media picked:', mediaContentId);
     
     const mediaSourceType = this._config.media_source_type || 'single_media';
     
@@ -15912,7 +23405,7 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     // Check for Reolink video source
     if (mediaContentId.includes('media-source://reolink/')) {
       detectedType = 'video';
-      console.log('[MediaCard] Detected Reolink video source');
+      console.log('[MediaViewerCard] Detected Reolink video source');
     } else {
       // Try extension detection for filesystem sources
       const extension = mediaContentId.split('.').pop()?.toLowerCase();
@@ -15925,11 +23418,11 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
     
     if (detectedType) {
       this._config.media_type = detectedType;
-      console.log('[MediaCard] Auto-detected media type:', detectedType);
+      console.log('[MediaViewerCard] Auto-detected media type:', detectedType);
     }
     
     this._fireConfigChanged();
-    console.log('[MediaCard] Config updated (media selected):', this._config);
+    console.log('[MediaViewerCard] Config updated (media selected):', this._config);
   }
 
   static styles = css`
@@ -16058,6 +23551,38 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
       align-items: center;
       gap: 8px;
       color: var(--primary-text-color);
+    }
+
+    .support-footer {
+      margin-top: 24px;
+      padding: 16px;
+      text-align: center;
+      border-top: 1px solid var(--divider-color, #e0e0e0);
+    }
+
+    .support-footer a {
+      display: block;
+      color: var(--primary-color, #007bff);
+      text-decoration: none;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .support-footer a:last-child {
+      margin-bottom: 0;
+    }
+
+    .support-footer a:hover {
+      text-decoration: underline;
+    }
+
+    .support-footer .coffee-icon {
+      font-size: 16px;
+      margin-right: 6px;
+    }
+
+    .support-footer .love-icon {
+      font-size: 14px;
     }
   `;
 
@@ -16210,6 +23735,45 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
               ${this._config.filters?.date_range?.start || this._config.filters?.date_range?.end ? html`
                 <div style="margin-top: 8px; padding: 8px; background: var(--info-color, #e3f2fd); border-radius: 4px; font-size: 12px;">
                   ${this._getDateRangeDescription()}
+                </div>
+              ` : ''}
+            </div>
+
+            <div style="margin-top: 16px;">
+              <div style="font-weight: 500; margin-bottom: 8px;">🕒 Time of Day Filter</div>
+              <p style="margin: 4px 0 12px 0; font-size: 12px; color: var(--secondary-text-color, #666);">
+                Filter by the time portion of EXIF date_taken (falls back to created_time). Supports overnight ranges like 22:00 to 06:00.
+              </p>
+
+              <div class="config-row">
+                <label>Start Time</label>
+                <div>
+                  <input
+                    type="time"
+                    .value=${this._config.filters?.time_range?.start || this._config.filters?.time_start || ''}
+                    @input=${this._handleTimeRangeStartChanged}
+                    style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;"
+                  />
+                  <div class="help-text">Show media from this time onwards each day (leave empty for no lower limit)</div>
+                </div>
+              </div>
+
+              <div class="config-row">
+                <label>End Time</label>
+                <div>
+                  <input
+                    type="time"
+                    .value=${this._config.filters?.time_range?.end || this._config.filters?.time_end || ''}
+                    @input=${this._handleTimeRangeEndChanged}
+                    style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;"
+                  />
+                  <div class="help-text">Show media up to this time each day (leave empty for no upper limit)</div>
+                </div>
+              </div>
+
+              ${this._config.filters?.time_range?.start || this._config.filters?.time_range?.end || this._config.filters?.time_start || this._config.filters?.time_end ? html`
+                <div style="margin-top: 8px; padding: 8px; background: var(--info-color, #e3f2fd); border-radius: 4px; font-size: 12px;">
+                  ${this._getTimeRangeDescription()}
                 </div>
               ` : ''}
             </div>
@@ -16392,6 +23956,17 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
               </div>
             </div>
           ` : ''}
+
+          <!-- excluded_paths callout - always shown for folder mode -->
+          <div style="grid-column: 1 / -1; margin-top: 8px; padding: 12px 16px; background: var(--secondary-background-color); border-radius: 8px; border-left: 4px solid var(--info-color, #4ba3e3);">
+            <div style="font-weight: 500; margin-bottom: 6px; color: var(--primary-text-color);">📁 Exclude Subfolders (YAML only)</div>
+            <div style="color: var(--secondary-text-color); font-size: 0.9em; line-height: 1.5; margin-bottom: 8px;">Use <code style="background: var(--code-background-color, rgba(0,0,0,0.1)); padding: 1px 4px; border-radius: 3px;">excluded_paths</code> in YAML to skip specific subfolders. Supports glob patterns:</div>
+            <pre style="margin: 0 0 8px 0; padding: 8px; background: var(--code-background-color, rgba(0,0,0,0.15)); border-radius: 4px; font-size: 0.8em; overflow-x: auto; color: var(--primary-text-color);">excluded_paths:
+  - "Burst/**"           # folder + all contents
+  - "**/Thumbnails/**"   # any depth
+  - "**/.thumbnails/**"</pre>
+            <a href="https://github.com/markaggar/ha-media-card/blob/master/docs/guides/yaml-only-features.md#excluded_paths" target="_blank" rel="noopener noreferrer" style="color: var(--primary-color); font-size: 0.85em;">View full pattern syntax →</a>
+          </div>
         ` : ''}
 
         <div class="config-row">
@@ -16459,6 +24034,33 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
               <div class="help-text">Automatically advance to next media every N seconds (0 = disabled)</div>
             </div>
           </div>
+          ${MediaProvider.isMediaIndexActive(this._config) ? html`
+            <div class="config-row">
+              <label>Queue Lookahead</label>
+              <div>
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  .value=${this._config.queue_lookahead ?? 10}
+                  @input=${(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (e.target.value === '') {
+                      const { queue_lookahead, ...rest } = this._config;
+                      this._config = rest;
+                      this._fireConfigChanged();
+                    } else if (!isNaN(v) && v >= 1 && v <= 100) {
+                      this._config = { ...this._config, queue_lookahead: v };
+                      this._fireConfigChanged();
+                    }
+                  }}
+                  placeholder="10"
+                />
+                <div class="help-text">Items to pre-fetch ahead of current position in Queue Preview (1–100, MediaIndex only)</div>
+              </div>
+            </div>
+          ` : ''}
         ` : ''}
 
         ${this._config.media_type === 'video' || this._config.media_type === 'all' ? html`
@@ -16579,6 +24181,18 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
               <div class="help-text">Fixed card height in pixels (100-5000, takes precedence over max height)</div>
             </div>
           </div>
+
+          <div class="config-row">
+            <label>Fill Height</label>
+            <div>
+              <input
+                type="checkbox"
+                .checked=${this._config.card_height_fill === true}
+                @change=${this._cardHeightFillChanged}
+              />
+              <div class="help-text">Fill card height with image, cropping to fit (cover). Requires Card Height to be set.</div>
+            </div>
+          </div>
           
           <div class="config-row">
             <label>Default Zoom Level</label>
@@ -16625,18 +24239,6 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
           </div>
           
           <div class="config-row">
-            <label>Refresh Button</label>
-            <div>
-              <input
-                type="checkbox"
-                .checked=${this._config.show_refresh_button || false}
-                @change=${this._refreshButtonChanged}
-              />
-              <div class="help-text">Show manual refresh button on the card</div>
-            </div>
-          </div>
-          
-          <div class="config-row">
             <label>Auto-Refresh Interval</label>
             <div>
               <input
@@ -16649,6 +24251,37 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
                 step="1"
               />
               <div class="help-text">Check for new files every N seconds (0 = disabled). Single media: reloads image URL. Folder mode: checks for new files and refreshes queue if at newest position.</div>
+            </div>
+          </div>
+
+          <div class="config-row">
+            <label>Disable Cache Busting</label>
+            <div>
+              <input
+                type="checkbox"
+                .checked=${this._config.disable_cache_busting || false}
+                @change=${this._disableCacheBustingChanged}
+              />
+              <div class="help-text">Allow browser to cache images (do not append timestamp to URLs). Useful for slideshow folders with static files where bandwidth matters. Note: manual refresh always bypasses browser cache regardless of this setting.</div>
+            </div>
+          </div>
+
+          <div class="config-row">
+            <label>Shared Queue ID</label>
+            <div>
+              <input
+                type="text"
+                .value=${this._config.shared_queue_id || ''}
+                @input=${(e) => {
+                  const val = e.target.value.trim();
+                  this._config = val
+                    ? { ...this._config, shared_queue_id: val }
+                    : (() => { const c = { ...this._config }; delete c.shared_queue_id; return c; })();
+                  this.dispatchEvent(new CustomEvent('config-changed', { detail: { config: this._config } }));
+                }}
+                placeholder="e.g. main-slideshow"
+              />
+              <div class="help-text">Optional. Cards with the same ID share their queue and position — across views, tabs, and devices. Same-device sync uses browser events; cross-device sync (phones, tablets, other browsers) requires Media Index. Leave empty to disable.</div>
             </div>
           </div>
         </div>
@@ -16843,6 +24476,30 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
           </div>
 
           <div class="config-row">
+            <label>Show Burst Count</label>
+            <div>
+              <input
+                type="checkbox"
+                .checked=${this._config.metadata?.show_burst_info === true}
+                @change=${this._metadataShowBurstInfoChanged}
+              />
+              <div class="help-text">Display 📸 N burst group size in the metadata header (requires media_index integration)</div>
+            </div>
+          </div>
+
+          <div class="config-row">
+            <label>Prefer Burst Favorites</label>
+            <div>
+              <input
+                type="checkbox"
+                .checked=${this._config.auto_select_burst_favorite === true}
+                @change=${this._autoSelectBurstFavoriteChanged}
+              />
+              <div class="help-text">Only show favorited images from burst groups — non-favorites are excluded at query time by the media_index backend. Requires media_index v1.6.0+ with index_burst_groups run on the library.</div>
+            </div>
+          </div>
+
+          <div class="config-row">
             <label>Overlay Opacity</label>
             <div>
               <input
@@ -16944,7 +24601,7 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
               <div style="font-weight: 500; margin-bottom: 8px; color: var(--primary-text-color);">⚠️ Entity Configuration Required</div>
               <div style="margin-bottom: 8px; color: var(--primary-text-color);">To add entities to display, you must edit this card's YAML configuration:</div>
               <ol style="margin: 8px 0; padding-left: 20px; color: var(--secondary-text-color); line-height: 1.6;">
-                <li>Click "Show code editor" (bottom-left of the Media Card configuration)</li>
+                <li>Click "Show code editor" (bottom-left of the Media Viewer Card configuration)</li>
                 <li>Add an <code style="background: var(--code-editor-background-color, rgba(0,0,0,0.2)); padding: 2px 6px; border-radius: 3px; font-family: monospace;">entities:</code> array under <code style="background: var(--code-editor-background-color, rgba(0,0,0,0.2)); padding: 2px 6px; border-radius: 3px; font-family: monospace;">display_entities:</code></li>
               </ol>
               <div style="font-size: 13px; font-family: monospace; background: var(--code-editor-background-color, rgba(0,0,0,0.15)); padding: 12px; border-radius: 4px; margin: 8px 0; line-height: 1.5; color: var(--primary-text-color);">
@@ -17128,9 +24785,9 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
           </div>
         </div>
 
-        <!-- Fullscreen Button (always available) -->
+        <!-- Fullscreen & Refresh Buttons (always available) -->
         <div class="section">
-          <div class="section-title">🖼️ Fullscreen</div>
+          <div class="section-title">🖼️ Fullscreen &amp; Refresh</div>
           
           <div class="config-row">
             <label>Fullscreen Button</label>
@@ -17141,6 +24798,18 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
                 @change=${this._actionButtonsEnableFullscreenChanged}
               />
               <div class="help-text">Show fullscreen button to automatically pause and initiate full screen mode (see Kiosk mode for automatic full screen options)</div>
+            </div>
+          </div>
+
+          <div class="config-row">
+            <label>Refresh Button</label>
+            <div>
+              <input
+                type="checkbox"
+                .checked=${this._config.show_refresh_button || false}
+                @change=${this._refreshButtonChanged}
+              />
+              <div class="help-text">Show manual refresh button on the card</div>
             </div>
           </div>
         </div>
@@ -17210,7 +24879,7 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
                 <div class="help-text">Review rapid-fire photos taken at the same time as current media item (requires media_index)</div>
               </div>
             </div>
-            
+
             <div class="config-row">
               <label>Same Date Button</label>
               <div>
@@ -17244,6 +24913,30 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
                   @change=${this._actionButtonsHideOnThisDayButtonChanged}
                 />
                 <div class="help-text">Hide the Through the Years action button; the feature remains accessible via the clock/date overlay</div>
+              </div>
+            </div>
+
+            <div class="config-row">
+              <label>Cast to TV Button</label>
+              <div>
+                <input
+                  type="checkbox"
+                  .checked=${this._config.show_cast_button === true}
+                  @change=${this._showCastButtonChanged}
+                />
+                <div class="help-text">Show a cast icon to mirror this card to any media_player entity in real time. Roku uses media_index.roku_ecp_cast (requires media_index). Other players (LG, Chromecast, etc.) use media_player.play_media directly.</div>
+              </div>
+            </div>
+
+            <div class="config-row">
+              <label>Filter &amp; Playback Button</label>
+              <div>
+                <input
+                  type="checkbox"
+                  .checked=${this._config.show_filter_button === true}
+                  @change=${this._showFilterButtonChanged}
+                />
+                <div class="help-text">Show a filter icon to temporarily override folder, media type, date range, mode, favorites, and video playback settings for the current session. Settings reset when the page reloads.</div>
               </div>
             </div>
           </div>
@@ -17394,34 +25087,91 @@ Tip: Check your Home Assistant media folder in Settings > System > Storage`;
             </div>
           </div>
         </div>
+
+        <div class="support-footer">
+          <a href="https://github.com/markaggar/ha-media-card/blob/master/docs/guides/yaml-only-features.md" target="_blank" rel="noopener noreferrer">
+            📋 Some options are only configurable via YAML &mdash; view the YAML-only features reference
+          </a>
+
+          <a href="https://github.com/markaggar/ha-media-card/issues" target="_blank" rel="noopener noreferrer">
+            Report an issue or request a feature on GitHub
+          </a>
+ 
+          <a href="https://buymeacoffee.com/markaggar" target="_blank" rel="noopener noreferrer">
+            Made with AI and <span class="love-icon">❤️</span> in Seattle. <strong>Enjoying Media Viewer Card? Buy me a coffee!</strong> <span class="coffee-icon">☕</span>
+          </a>
+        </div>
       </div>
     `;
   }
 }
-
 // Register the custom elements (guard against re-registration)
-if (!customElements.get('media-card')) {
-  customElements.define('media-card', MediaCard);
+if (!customElements.get('media-viewer-card')) {
+  customElements.define('media-viewer-card', MediaCard);
 }
-if (!customElements.get('media-card-editor')) {
-  customElements.define('media-card-editor', MediaCardEditor);
+if (!customElements.get('media-viewer-card-editor')) {
+  customElements.define('media-viewer-card-editor', MediaCardEditor);
+}
+// Backward-compat alias so existing configs using type: custom:media-card keep working.
+// Must be a subclass — the registry rejects registering the same constructor twice.
+class MediaCardAlias extends MediaCard {}
+if (!customElements.get('media-card')) {
+  customElements.define('media-card', MediaCardAlias);
 }
 
 // Register with Home Assistant
-window.customCards = window.customCards || [];
-if (!window.customCards.some(card => card.type === 'media-card')) {
+if (!Array.isArray(window.customCards)) {
+  window.customCards = [];
+}
+if (!window.customCards.some(card => card?.type === 'media-viewer-card')) {
   window.customCards.push({
-    type: 'media-card',
-    name: 'Media Card',
+    type: 'media-viewer-card',
+    name: 'Media Viewer Card',
     description: 'Display images and videos from local media folders with slideshow, favorites, and metadata',
     preview: true,
-    documentationURL: 'https://github.com/markaggar/ha-media-card'
+    documentationURL: 'https://github.com/markaggar/ha-media-card',
+    getEntitySuggestion(hass, entityId) {
+      // Only suggest for media_index sensor entities, identified by the scan_status attribute
+      // which is unique to the Media Index integration sensor.
+      if (entityId.split('.')[0] !== 'sensor') return null;
+      const attrs = hass.states[entityId]?.attributes || {};
+      if (attrs.scan_status === undefined) return null;
+
+      // Resolve the folder path: prefer media_source_uri (already a media-source:// URI),
+      // fall back to constructing one from the filesystem media_path.
+      let folderPath = attrs.media_source_uri || null;
+      if (!folderPath && attrs.media_path) {
+        const p = attrs.media_path.startsWith('/') ? attrs.media_path : '/' + attrs.media_path;
+        folderPath = `media-source://media_source${p}`;
+      }
+      if (!folderPath) return null;
+
+      return [
+        {
+          label: 'Random slideshow',
+          config: {
+            type: 'custom:media-viewer-card',
+            media_source_type: 'folder',
+            folder: { path: folderPath, mode: 'random', recursive: true },
+          },
+        },
+        {
+          label: 'Sequential slideshow',
+          config: {
+            type: 'custom:media-viewer-card',
+            media_source_type: 'folder',
+            folder: { path: folderPath, mode: 'sequential', recursive: true },
+          },
+        },
+      ];
+    },
   });
 }
 
 console.info(
-  '%c  MEDIA-CARD  %c  v5.6.6 Loaded  ',
+  '%c  MEDIA-VIEWER-CARD  %c  v5.13.0 Loaded  ',
   'color: lime; font-weight: bold; background: black',
   'color: white; font-weight: bold; background: green'
 );
 
+})();
